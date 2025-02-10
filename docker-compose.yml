@@ -6,9 +6,9 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     ports:
-      - "3000:3000"
+      - "${DOCKER_FRONTEND_PORT:-3000}:3000"
     environment:
-      - NODE_ENV=development
+      - NODE_ENV=${NODE_ENV:-development}
     volumes:
       - ./frontend:/app
       - /app/node_modules
@@ -20,9 +20,15 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     ports:
-      - "4000:4000"
+      - "${DOCKER_BACKEND_PORT:-4000}:4000"
     environment:
-      - NODE_ENV=development
+      - NODE_ENV=${NODE_ENV:-development}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - SOLANA_RPC_URL=${SOLANA_RPC_URL}
     volumes:
       - ./backend:/app
       - /app/node_modules
+
+networks:
+  default:
+    name: solana-ai-network
