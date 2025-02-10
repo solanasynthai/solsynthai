@@ -11,16 +11,55 @@ on:
     branches: [ main, develop ]
 
 jobs:
-  build:
+  build-and-test:
     runs-on: ubuntu-latest
+    
     steps:
       - uses: actions/checkout@v3
-      - uses: actions/setup-node@v3
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
         with:
           node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+      
       - name: Install Dependencies
-        run: cd frontend && npm install
+        run: |
+          cd frontend
+          npm ci
+      
+      - name: Run Linter
+        run: |
+          cd frontend
+          npm run lint
+      
       - name: Run Tests
-        run: cd frontend && npm test
+        run: |
+          cd frontend
+          npm test -- --coverage
+      
       - name: Build
-        run: cd frontend && npm run build
+        run: |
+          cd frontend
+          npm run build
+      
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: frontend-build
+          path: frontend/build
+          retention-days: 7
+
+  deploy:
+    needs: build-and-test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Download Build Artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: frontend-build
+          path: frontend/build
+      
