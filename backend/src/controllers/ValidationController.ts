@@ -1,160 +1,234 @@
 import { Request, Response } from 'express';
 import { PublicKey } from '@solana/web3.js';
-import { AccountStateManager } from '../services/solana/state/AccountStateManager';
 import { AccountSchemaManager } from '../services/solana/schema/AccountSchemaManager';
+import { AccountStateValidator } from '../services/solana/validators/AccountStateValidator';
+import { SecurityAnalyzer } from '../services/security/SecurityAnalyzer';
 import { ContractError, NotFoundError } from '../utils/errors';
-import { validateContractData } from '../validators/contractValidator';
 import { logger } from '../utils/logger';
 
-export class ContractController {
-    private stateManager: AccountStateManager;
+export class ValidationController {
     private schemaManager: AccountSchemaManager;
+    private stateValidator: AccountStateValidator;
+    private securityAnalyzer: SecurityAnalyzer;
 
     constructor() {
-        this.stateManager = AccountStateManager.getInstance();
         this.schemaManager = AccountSchemaManager.getInstance();
+        this.stateValidator = AccountStateValidator.getInstance();
+        this.securityAnalyzer = new SecurityAnalyzer();
     }
 
-    public createContract = async (req: Request, res: Response): Promise<void> => {
-        const { name, description, schema, template } = req.body;
+    public validateSchema = async (req: Request, res: Response): Promise<void> => {
+        const { schema } = req.body;
 
         try {
-            // Validate schema
             const validationResult = await this.schemaManager.validateSchema(schema);
+
             if (!validationResult.isValid) {
                 throw new ContractError('Invalid schema', {
                     errors: validationResult.errors
                 });
             }
 
-            // Create contract
-            const contract = await this.stateManager.createContract({
-                name,
-                description,
-                schema,
-                template
+            // Perform additional schema analysis
+            const analysis = await this.schemaManager.analyzeSchema(schema);
+
+            logger.info('Schema validation completed', {
+                isValid: true,
+                warnings: analysis.warnings.length
             });
-
-            logger.info('Contract created', { contractId: contract.pubkey });
-
-            res.status(201).json({
-                success: true,
-                data: contract
-            });
-        } catch (error) {
-            logger.error('Contract creation failed', { error });
-            throw error;
-        }
-    };
-
-    public getContract = async (req: Request, res: Response): Promise<void> => {
-        const { pubkey } = req.params;
-
-        try {
-            const contract = await this.stateManager.loadAccount(
-                new PublicKey(pubkey)
-            );
-
-            if (!contract) {
-                throw new NotFoundError('Contract');
-            }
 
             res.json({
                 success: true,
-                data: contract
+                data: {
+                    isValid: true,
+                    analysis: {
+                        complexity: analysis.complexity,
+                        size: analysis.size,
+                        warnings: analysis.warnings,
+                        recommendations: analysis.recommendations
+                    }
+                }
             });
         } catch (error) {
-            logger.error('Contract fetch failed', { pubkey, error });
+            logger.error('Schema validation failed', {
+                error: error.message,
+                schema: JSON.stringify(schema)
+            });
             throw error;
         }
     };
 
-    public updateContract = async (req: Request, res: Response): Promise<void> => {
-        const { pubkey } = req.params;
-        const { updates } = req.body;
+    public validateData = async (req: Request, res: Response): Promise<void> => {
+        const { schema, data } = req.body;
 
         try {
-            const contract = await this.stateManager.loadAccount(
-                new PublicKey(pubkey)
-            );
-
-            if (!contract) {
-                throw new NotFoundError('Contract');
-            }
-
-            // Validate updates
-            const validationResult = await validateContractData(updates, contract.schema);
-            if (!validationResult.isValid) {
-                throw new ContractError('Invalid contract data', {
-                    errors: validationResult.errors
+            // Validate schema first
+            const schemaValidation = await this.schemaManager.validateSchema(schema);
+            if (!schemaValidation.isValid) {
+                throw new ContractError('Invalid schema', {
+                    errors: schemaValidation.errors
                 });
             }
 
-            // Apply updates
-            const updatedContract = await this.stateManager.updateAccount(
+            // Validate data against schema
+            const dataValidation = await this.stateValidator.validateAccountData(
+                data,
+                schema,
+                {
+                    strict: true,
+                    checkDataSize: true
+                }
+            );
+
+            logger.info('Data validation completed', {
+                isValid: dataValidation.isValid,
+                errors: dataValidation.errors.length,
+                warnings: dataValidation.warnings.length
+            });
+
+            res.json({
+                success: true,
+                data: {
+                    isValid: dataValidation.isValid,
+                    errors: dataValidation.errors,
+                    warnings: dataValidation.warnings
+                }
+            });
+        } catch (error) {
+            logger.error('Data validation failed', {
+                error: error.message,
+                schema: JSON.stringify(schema),
+                data: JSON.stringify(data)
+            });
+            throw error;
+        }
+    };
+
+    public validateSecurity = async (req: Request, res: Response): Promise<void> => {
+        const { contractId, code } = req.body;
+
+        try {
+            // Analyze code security
+            const securityAnalysis = await this.securityAnalyzer.analyzeContract(code);
+
+            // Check for critical vulnerabilities
+            if (securityAnalysis.criticalIssues.length > 0) {
+                throw new ContractError('Critical security vulnerabilities detected', {
+                    vulnerabilities: securityAnalysis.criticalIssues
+                });
+            }
+
+            logger.info('Security validation completed', {
+                contractId,
+                issues: {
+                    critical: securityAnalysis.criticalIssues.length,
+                    high: securityAnalysis.highIssues.length,
+                    medium: securityAnalysis.mediumIssues.length,
+                    low: securityAnalysis.lowIssues.length
+                }
+            });
+
+            res.json({
+                success: true,
+                data: {
+                    isSecure: securityAnalysis.isSecure,
+                    score: securityAnalysis.securityScore,
+                    issues: {
+                        critical: securityAnalysis.criticalIssues,
+                        high: securityAnalysis.highIssues,
+                        medium: securityAnalysis.mediumIssues,
+                        low: securityAnalysis.lowIssues
+                    },
+                    recommendations: securityAnalysis.recommendations,
+                    metrics: {
+                        complexity: securityAnalysis.metrics.complexity,
+                        coverage: securityAnalysis.metrics.coverage,
+                        vulnerabilities: securityAnalysis.metrics.vulnerabilities
+                    }
+                }
+            });
+        } catch (error) {
+            logger.error('Security validation failed', {
+                contractId,
+                error: error.message
+            });
+            throw error;
+        }
+    };
+
+    public validateAccountState = async (req: Request, res: Response): Promise<void> => {
+        const { pubkey } = req.params;
+        const { checkRentExemption } = req.query;
+
+        try {
+            const accountInfo = await this.stateValidator.validateAccountInfo(
                 new PublicKey(pubkey),
-                updates
+                {
+                    checkRentExemption: checkRentExemption === 'true'
+                }
             );
 
-            logger.info('Contract updated', { contractId: pubkey });
+            logger.info('Account state validation completed', {
+                pubkey,
+                isValid: accountInfo.isValid
+            });
 
             res.json({
                 success: true,
-                data: updatedContract
+                data: {
+                    isValid: accountInfo.isValid,
+                    state: accountInfo.state,
+                    errors: accountInfo.errors,
+                    warnings: accountInfo.warnings,
+                    metrics: {
+                        size: accountInfo.metrics.size,
+                        lamports: accountInfo.metrics.lamports,
+                        rentEpoch: accountInfo.metrics.rentEpoch
+                    }
+                }
             });
         } catch (error) {
-            logger.error('Contract update failed', { pubkey, error });
+            logger.error('Account state validation failed', {
+                pubkey,
+                error: error.message
+            });
             throw error;
         }
     };
 
-    public validateContract = async (req: Request, res: Response): Promise<void> => {
-        const { pubkey } = req.params;
-        const { data } = req.body;
+    public validateStructure = async (req: Request, res: Response): Promise<void> => {
+        const { schema, structure } = req.body;
 
         try {
-            const contract = await this.stateManager.loadAccount(
-                new PublicKey(pubkey)
+            const validationResult = await this.stateValidator.validateStructure(
+                structure,
+                schema,
+                {
+                    validateReferences: true,
+                    validateConstraints: true
+                }
             );
 
-            if (!contract) {
-                throw new NotFoundError('Contract');
-            }
-
-            const validationResult = await validateContractData(data, contract.schema);
+            logger.info('Structure validation completed', {
+                isValid: validationResult.isValid,
+                errors: validationResult.errors.length
+            });
 
             res.json({
                 success: true,
-                data: validationResult
+                data: {
+                    isValid: validationResult.isValid,
+                    errors: validationResult.errors,
+                    warnings: validationResult.warnings,
+                    details: validationResult.details
+                }
             });
         } catch (error) {
-            logger.error('Contract validation failed', { pubkey, error });
-            throw error;
-        }
-    };
-
-    public deleteContract = async (req: Request, res: Response): Promise<void> => {
-        const { pubkey } = req.params;
-
-        try {
-            const contract = await this.stateManager.loadAccount(
-                new PublicKey(pubkey)
-            );
-
-            if (!contract) {
-                throw new NotFoundError('Contract');
-            }
-
-            await this.stateManager.deleteAccount(new PublicKey(pubkey));
-
-            logger.info('Contract deleted', { contractId: pubkey });
-
-            res.json({
-                success: true,
-                message: 'Contract deleted successfully'
+            logger.error('Structure validation failed', {
+                error: error.message,
+                schema: JSON.stringify(schema),
+                structure: JSON.stringify(structure)
             });
-        } catch (error) {
-            logger.error('Contract deletion failed', { pubkey, error });
             throw error;
         }
     };
