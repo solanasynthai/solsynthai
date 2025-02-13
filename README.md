@@ -1,4 +1,4 @@
-# https://iyaiclmrvivkbencvqwi.supabase.co/storage/v1/object/public/public//SolSynthAI-removebg-preview.png
+# SolSynthAI
 
 An advanced platform that leverages AI to generate, deploy, and manage Solana smart contracts with ease. Turn natural language into production-ready Solana programs.
 
