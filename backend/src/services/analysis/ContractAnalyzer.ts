@@ -479,4 +479,326 @@ export class ContractAnalyzer extends EventEmitter {
             'REENTRANCY': 'Implement a reentrancy guard using mutex patterns',
             'UNCHECKED_MATH': 'Use checked math operations or explicit overflow checks',
             'UNPROTECTED_UPDATE': 'Add access control checks to state-modifying functions',
-            'MISSING_VALIDATION
+            'MISSING_VALIDATION': 'Implement comprehensive input validation',
+            'TIMESTAMP_DEPENDENCE': 'Use block numbers instead of timestamps for time-sensitive operations',
+            'FLOATING_PRAGMA': 'Lock the compiler version to ensure consistent behavior',
+            'DOS_LOOP': 'Implement proper bounds and gas checks for loops',
+            'UNSAFE_CASTING': 'Use safe casting operations with explicit checks',
+            'MISSING_EVENTS': 'Add events for important state changes',
+            'HARDCODED_ADDRESS': 'Make addresses configurable through constructor or admin functions',
+            'WEAK_ACCESS': 'Implement strong access control mechanisms',
+            'MISSING_ZERO_CHECK': 'Add zero address validation',
+            'UNINITIALIZED_STATE': 'Ensure proper initialization of state variables',
+            'UNSAFE_DELEGATECALL': 'Avoid delegatecall or implement strict safety checks',
+            'VARIABLE_SHADOWING': 'Rename variables to avoid shadowing',
+            'MISSING_MODIFIER': 'Add appropriate modifiers for access control',
+            'INSUFFICIENT_GAS': 'Optimize gas usage or implement batching',
+            'LOCKED_ETHER': 'Implement withdrawal patterns',
+            'ARBITRARY_JUMP': 'Remove dynamic jumps or implement strict validation',
+            'STATE_DEPENDENCY': 'Implement proper state synchronization',
+            'WEAK_RANDOMNESS': 'Use verifiable random functions (VRF) for randomness',
+            'FRONT_RUNNING': 'Implement commit-reveal patterns or other front-running protections',
+            'OVERFLOW_UNDERFLOW': 'Use SafeMath or checked arithmetic operations',
+            'RACE_CONDITION': 'Implement proper synchronization mechanisms',
+            'DOS_GAS_LIMIT': 'Implement gas-efficient patterns and avoid unbounded operations'
+        };
+
+        const defaultRecommendation = 'Review and refactor the code according to best practices';
+        return recommendations[issue.errorType] || defaultRecommendation;
+    }
+
+    private tokenizeCode(code: string): Array<{ type: string; value: string; line: number; column: number }> {
+        const tokens: Array<{ type: string; value: string; line: number; column: number }> = [];
+        let line = 1;
+        let column = 0;
+        let i = 0;
+
+        while (i < code.length) {
+            let char = code[i];
+
+            // Track line and column
+            if (char === '\n') {
+                line++;
+                column = 0;
+                tokens.push({ type: 'NEWLINE', value: '\n', line, column });
+                i++;
+                continue;
+            }
+            column++;
+
+            // Skip whitespace
+            if (/\s/.test(char)) {
+                i++;
+                continue;
+            }
+
+            // Handle comments
+            if (char === '/' && code[i + 1] === '/') {
+                tokens.push({ type: 'COMMENT_START', value: '//', line, column });
+                i += 2;
+                while (i < code.length && code[i] !== '\n') i++;
+                tokens.push({ type: 'COMMENT_END', value: '', line, column });
+                continue;
+            }
+
+            if (char === '/' && code[i + 1] === '*') {
+                tokens.push({ type: 'COMMENT_START', value: '/*', line, column });
+                i += 2;
+                while (i < code.length && !(code[i] === '*' && code[i + 1] === '/')) {
+                    if (code[i] === '\n') {
+                        line++;
+                        column = 0;
+                    }
+                    i++;
+                }
+                i += 2;
+                tokens.push({ type: 'COMMENT_END', value: '*/', line, column });
+                continue;
+            }
+
+            // Handle string literals
+            if (char === '"' || char === "'") {
+                let value = char;
+                const quote = char;
+                i++;
+                column++;
+                while (i < code.length && code[i] !== quote) {
+                    if (code[i] === '\\' && i + 1 < code.length) {
+                        value += code[i] + code[i + 1];
+                        i += 2;
+                        column += 2;
+                    } else {
+                        value += code[i];
+                        i++;
+                        column++;
+                    }
+                }
+                value += code[i];
+                tokens.push({ type: 'LITERAL', value, line, column });
+                i++;
+                continue;
+            }
+
+            // Handle numbers
+            if (/\d/.test(char)) {
+                let value = '';
+                while (i < code.length && /[\d.]/.test(code[i])) {
+                    value += code[i];
+                    i++;
+                    column++;
+                }
+                tokens.push({ type: 'LITERAL', value, line, column });
+                continue;
+            }
+
+            // Handle identifiers
+            if (/[a-zA-Z_]/.test(char)) {
+                let value = '';
+                while (i < code.length && /[a-zA-Z0-9_]/.test(code[i])) {
+                    value += code[i];
+                    i++;
+                    column++;
+                }
+                tokens.push({ type: 'IDENTIFIER', value, line, column });
+                continue;
+            }
+
+            // Handle operators
+            const operators = ['==', '!=', '>=', '<=', '=>', '+=', '-=', '*=', '/=', '++', '--'];
+            const twoCharOp = code.slice(i, i + 2);
+            if (operators.includes(twoCharOp)) {
+                tokens.push({ type: 'OPERATOR', value: twoCharOp, line, column });
+                i += 2;
+                column += 2;
+                continue;
+            }
+
+            // Handle single-char operators and punctuation
+            const singleCharOps = '+-*/%=<>!&|^~?:.,;{}[]()';
+            if (singleCharOps.includes(char)) {
+                tokens.push({ type: 'OPERATOR', value: char, line, column });
+                i++;
+                continue;
+            }
+
+            // Skip unknown characters
+            i++;
+        }
+
+        return tokens;
+    }
+
+    private async checkCompatibility(code: string): Promise<ValidationError[]> {
+        const warnings: ValidationError[] = [];
+        const tokens = this.tokenizeCode(code);
+        
+        // Check for deprecated features
+        const deprecatedFeatures = new Map([
+            ['syscall', 'Use cross-program invocation (CPI) instead of syscalls'],
+            ['declare_id!', 'Consider using more recent program ID declaration patterns']
+        ]);
+
+        let line = 1;
+        for (const token of tokens) {
+            if (token.type === 'IDENTIFIER') {
+                if (deprecatedFeatures.has(token.value)) {
+                    warnings.push({
+                        line: token.line,
+                        column: token.column,
+                        message: `Deprecated feature: ${deprecatedFeatures.get(token.value)}`,
+                        severity: 'warning'
+                    });
+                }
+            }
+            if (token.type === 'NEWLINE') line++;
+        }
+
+        return warnings;
+    }
+
+    private async performDeepAnalysis(code: string, cfg: any): Promise<ValidationError[]> {
+        const warnings: ValidationError[] = [];
+
+        // Perform data flow analysis
+        const dataFlowResults = await this.dataFlowAnalyzer.analyze(cfg);
+        warnings.push(...dataFlowResults);
+
+        // Check for common anti-patterns
+        const antiPatterns = await this.detectAntiPatterns(code);
+        warnings.push(...antiPatterns);
+
+        // Check for potential optimization opportunities
+        const optimizationOpportunities = await this.findOptimizationOpportunities(code, cfg);
+        warnings.push(...optimizationOpportunities);
+
+        return warnings;
+    }
+
+    private countLines(code: string): number {
+        return code.split('\n').length;
+    }
+
+    private countSourceLines(code: string): number {
+        return code.split('\n')
+            .filter(line => line.trim() && !line.trim().startsWith('//'))
+            .length;
+    }
+
+    private countComments(code: string): number {
+        return code.split('\n')
+            .filter(line => line.trim().startsWith('//') || line.trim().startsWith('/*'))
+            .length;
+    }
+
+    private countFunctions(code: string): number {
+        const functionMatches = code.match(/fn\s+\w+\s*\(/g);
+        return functionMatches ? functionMatches.length : 0;
+    }
+
+    private countStructs(code: string): number {
+        const structMatches = code.match(/struct\s+\w+/g);
+        return structMatches ? structMatches.length : 0;
+    }
+
+    private calculateDocumentationCoverage(code: string): number {
+        const functions = code.match(/fn\s+\w+\s*\(/g) || [];
+        const documentedFunctions = code.match(/\/\/\/.*\s*fn\s+\w+\s*\(/g) || [];
+        return functions.length > 0 ? documentedFunctions.length / functions.length : 1;
+    }
+
+    private assessDocumentationQuality(code: string): number {
+        const docComments = code.match(/\/\/\/[^\n]+/g) || [];
+        let totalScore = 0;
+
+        for (const comment of docComments) {
+            let score = 0;
+            // Check for parameter documentation
+            if (comment.includes('@param')) score += 0.3;
+            // Check for return value documentation
+            if (comment.includes('@return')) score += 0.3;
+            // Check for description length
+            if (comment.length > 50) score += 0.2;
+            // Check for examples
+            if (comment.includes('@example')) score += 0.2;
+            totalScore += score;
+        }
+
+        return docComments.length > 0 ? totalScore / docComments.length : 0;
+    }
+
+    private async detectAntiPatterns(code: string): Promise<ValidationError[]> {
+        const warnings: ValidationError[] = [];
+        const tokens = this.tokenizeCode(code);
+
+        // Check for large functions
+        let currentFunctionLines = 0;
+        let inFunction = false;
+        let functionStartLine = 0;
+
+        for (const token of tokens) {
+            if (token.type === 'IDENTIFIER' && token.value === 'fn') {
+                inFunction = true;
+                functionStartLine = token.line;
+            } else if (token.type === 'OPERATOR' && token.value === '}' && inFunction) {
+                if (currentFunctionLines > 50) {
+                    warnings.push({
+                        line: functionStartLine,
+                        column: 0,
+                        message: 'Function is too large (> 50 lines)',
+                        severity: 'warning'
+                    });
+                }
+                inFunction = false;
+                currentFunctionLines = 0;
+            } else if (token.type === 'NEWLINE' && inFunction) {
+                currentFunctionLines++;
+            }
+        }
+
+        return warnings;
+    }
+
+    private async findOptimizationOpportunities(code: string, cfg: any): Promise<ValidationError[]> {
+        const warnings: ValidationError[] = [];
+
+        // Check for expensive operations in loops
+        const loops = cfg.findLoops();
+        for (const loop of loops) {
+            const expensiveOps = this.findExpensiveOperations(loop);
+            if (expensiveOps.length > 0) {
+                warnings.push({
+                    line: loop.startLine,
+                    column: 0,
+                    message: `Expensive operation(s) in loop: ${expensiveOps.join(', ')}`,
+                    severity: 'warning'
+                });
+            }
+        }
+
+        return warnings;
+    }
+
+    private findExpensiveOperations(node: any): string[] {
+        const expensive: string[] = [];
+        const expensivePatterns = [
+            { pattern: /clone/, description: 'cloning' },
+            { pattern: /to_string/, description: 'string conversion' },
+            { pattern: /serialize/, description: 'serialization' },
+            { pattern: /deserialize/, description: 'deserialization' },
+            { pattern: /allocate/, description: 'memory allocation' }
+        ];
+
+        const nodeText = node.getText();
+        for (const { pattern, description } of expensivePatterns) {
+            if (pattern.test(nodeText)) {
+                expensive.push(description);
+            }
+        }
+
+        return expensive;
+    }
+
+    public async cleanup(): Promise<void> {
+        this.removeAllListeners();
+    }
+}
