@@ -181,6 +181,7 @@ cargo test
 
 - Documentation: [docs.solsynthai.org](https://docs.solsynthai.org) (Coming Soon)
 - Telegram: [Join Community](https://t.me/solanasynthai)
+- Website: [SolSynthAI](https://solsynthai.org)
 
 ## License
 
