@@ -4,7 +4,7 @@ An advanced platform that leverages AI to generate, deploy, and manage Solana sm
 
 ## Overview
 
-SolSynthai automates the creation, optimization, and deployment of Solana smart contracts using AI. The platform supports various contract types including tokens, NFTs, and DeFi protocols, with built-in security analysis and best practices.
+SolSynthai automates the creation, optimization, and deployment of Solana smart contracts using AI. The platform supports various contract types including tokens, NFTs, and DeFi protocols, with built-in security analysis and best practices. Further contract templates are in production and will be released in conjunction with the Web App release.
 
 [Web App](https://solsynthai.org) (Beta-release scheduled for 1st March 2025)
 
@@ -37,7 +37,7 @@ SolSynthai automates the creation, optimization, and deployment of Solana smart 
 
 ### Prerequisites
 ```bash
-# Install Node.js 18+
+# Install Node.js
 https://nodejs.org/
 
 # Install Rust
