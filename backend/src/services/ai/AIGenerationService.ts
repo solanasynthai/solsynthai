@@ -1,293 +1,249 @@
-import OpenAI from 'openai';
-import { EventEmitter } from 'events';
-import { ContractTemplate } from '../../types';
-import { TemplateEngine } from '../generation/template/TemplateEngine';
-import { SecurityPatternGenerator } from '../generation/rust/security/SecurityPatternGenerator';
-import { RustCodeGenerator } from '../generation/rust/RustCodeGenerator';
-import { ContractAnalyzer } from '../analysis/ContractAnalyzer';
-import { AIServiceError } from '../../utils/errors';
-import { logger } from '../../utils/logger';
+import OpenAI from 'openai'
+import { ContractTemplate, GenerationOptions, AnalysisResult } from '../../types'
+import { AIServiceError } from '../../utils/errors'
+import { logger, logError } from '../../utils/logger'
+import { ContractAnalyzer } from '../analysis/ContractAnalyzer'
+import { TemplateEngine } from '../generation/template/TemplateEngine'
+import { SecurityPatternGenerator } from '../generation/rust/security/SecurityPatternGenerator'
+import { RustCodeGenerator } from '../generation/rust/RustCodeGenerator'
+import config from '../../config/config'
+import { Connection } from '@solana/web3.js'
+import { CacheService } from '../cache/CacheService'
+import { MetricsService } from '../monitoring/MetricsService'
 
-interface GenerationOptions {
-    temperature?: number;
-    maxTokens?: number;
-    model?: string;
-    requestId?: string;
-    includeTests?: boolean;
-    securityLevel?: 'basic' | 'standard' | 'high';
-    optimizationLevel?: 'minimal' | 'standard' | 'aggressive';
-}
+export class AIGenerationService {
+  private static instance: AIGenerationService
+  private openai: OpenAI
+  private analyzer: ContractAnalyzer
+  private templateEngine: TemplateEngine
+  private securityGenerator: SecurityPatternGenerator
+  private rustGenerator: RustCodeGenerator
+  private cache: CacheService
+  private metrics: MetricsService
 
-interface GenerationResult {
-    code: string;
-    model: string;
-    timestamp: number;
-    requestId?: string;
-    metadata?: {
-        tokens: number;
-        processingTime: number;
-        optimizations?: string[];
-        securityChecks?: string[];
-    };
-}
+  private readonly MAX_RETRIES = 3
+  private readonly RETRY_DELAY = 1000
+  private readonly CACHE_TTL = 3600 // 1 hour
+  private readonly MODEL_TEMPERATURE = 0.2
 
-export class AIGenerationService extends EventEmitter {
-    private openai: OpenAI;
-    private templateEngine: TemplateEngine;
-    private securityGenerator: SecurityPatternGenerator;
-    private codeGenerator: RustCodeGenerator;
-    private analyzer: ContractAnalyzer;
-    private readonly DEFAULT_MODEL = 'gpt-4';
-    private readonly MAX_RETRIES = 3;
-    private readonly RETRY_DELAY = 1000;
-    private readonly MAX_CONCURRENT_REQUESTS = 5;
-    private activeRequests = 0;
+  private constructor() {
+    this.openai = new OpenAI({
+      apiKey: config.ai.openaiApiKey
+    })
+    
+    const connection = new Connection(config.solana.rpcUrl)
+    this.analyzer = ContractAnalyzer.getInstance(connection)
+    this.templateEngine = TemplateEngine.getInstance()
+    this.securityGenerator = new SecurityPatternGenerator()
+    this.rustGenerator = new RustCodeGenerator()
+    this.cache = CacheService.getInstance()
+    this.metrics = MetricsService.getInstance()
+  }
 
-    constructor(apiKey: string) {
-        super();
-        this.openai = new OpenAI({ apiKey });
-        this.templateEngine = TemplateEngine.getInstance();
-        this.securityGenerator = new SecurityPatternGenerator();
-        this.codeGenerator = new RustCodeGenerator();
-        this.analyzer = new ContractAnalyzer();
+  public static getInstance(): AIGenerationService {
+    if (!AIGenerationService.instance) {
+      AIGenerationService.instance = new AIGenerationService()
     }
+    return AIGenerationService.instance
+  }
 
-    public async generateContractCode(
-        prompt: string,
-        options: GenerationOptions = {}
-    ): Promise<GenerationResult> {
-        const startTime = Date.now();
-        const requestId = options.requestId || crypto.randomUUID();
+  public async generateContract(
+    prompt: string,
+    options: GenerationOptions
+  ): Promise<{
+    template: ContractTemplate
+    analysis: AnalysisResult
+    code: string
+  }> {
+    const startTime = performance.now()
+    const cacheKey = this.generateCacheKey(prompt, options)
 
-        try {
-            await this.checkConcurrencyLimit();
-            this.activeRequests++;
+    try {
+      // Check cache first
+      const cached = await this.cache.get(cacheKey)
+      if (cached) {
+        this.metrics.increment('contract_generation_cache_hit')
+        return JSON.parse(cached)
+      }
 
-            // Generate initial code
-            const generatedCode = await this.retryOperation(
-                () => this.generateInitialCode(prompt, options),
-                'Initial code generation failed'
-            );
+      // Generate contract template
+      const template = await this.generateTemplate(prompt, options)
 
-            // Analyze and enhance code
-            const enhancedCode = await this.enhanceGeneratedCode(
-                generatedCode,
-                options
-            );
+      // Analyze template
+      const analysis = await this.analyzer.analyzeContract(template)
 
-            // Validate final code
-            const validationResult = await this.analyzer.validateGeneratedCode(
-                enhancedCode,
-                {
-                    validateSyntax: true,
-                    validateSecurity: true,
-                    validateCompatibility: true
-                }
-            );
+      // Apply security patterns
+      const securityModule = this.securityGenerator.generateSecurityModule({
+        level: options.security,
+        includeReentrancyGuard: this.needsReentrancyGuard(template),
+        includeAccessControl: this.needsAccessControl(template),
+        includeInputValidation: true
+      })
 
-            if (!validationResult.isValid) {
-                throw new AIServiceError(
-                    'Generated code validation failed',
-                    { errors: validationResult.errors }
-                );
-            }
-
-            const result: GenerationResult = {
-                code: enhancedCode,
-                model: options.model || this.DEFAULT_MODEL,
-                timestamp: Date.now(),
-                requestId,
-                metadata: {
-                    tokens: generatedCode.length,
-                    processingTime: Date.now() - startTime
-                }
-            };
-
-            this.emit('generation:complete', {
-                requestId,
-                duration: Date.now() - startTime
-            });
-
-            return result;
-
-        } catch (error) {
-            this.emit('generation:error', {
-                requestId,
-                error: error.message
-            });
-            throw this.handleError(error);
-        } finally {
-            this.activeRequests--;
+      // Generate Rust code
+      const code = await this.rustGenerator.generate(
+        template.schemas[0],
+        template.instructions,
+        {
+          level: options.optimization,
+          inlineThreshold: 50,
+          vectorizeLoops: true,
+          constPropagation: true
         }
+      )
+
+      const result = { template, analysis, code }
+
+      // Cache the result
+      await this.cache.set(
+        cacheKey,
+        JSON.stringify(result),
+        this.CACHE_TTL
+      )
+
+      // Record metrics
+      this.recordMetrics(startTime, template, analysis)
+
+      return result
+
+    } catch (error) {
+      logError('Contract generation failed', error as Error)
+      throw new AIServiceError('Failed to generate contract', {
+        prompt,
+        error: (error as Error).message
+      })
+    }
+  }
+
+  private async generateTemplate(
+    prompt: string,
+    options: GenerationOptions,
+    retry: number = 0
+  ): Promise<ContractTemplate> {
+    try {
+      const completion = await this.openai.chat.completions.create({
+        model: config.ai.model,
+        messages: [
+          {
+            role: 'system',
+            content: this.getSystemPrompt(options)
+          },
+          {
+            role: 'user',
+            content: prompt
+          }
+        ],
+        temperature: this.MODEL_TEMPERATURE,
+        max_tokens: config.ai.maxTokens,
+        top_p: 1,
+        frequency_penalty: 0,
+        presence_penalty: 0
+      })
+
+      const templateString = completion.choices[0]?.message?.content
+      if (!templateString) {
+        throw new Error('No template generated')
+      }
+
+      return this.parseTemplate(templateString)
+
+    } catch (error) {
+      if (retry < this.MAX_RETRIES) {
+        await new Promise(resolve => setTimeout(resolve, this.RETRY_DELAY))
+        return this.generateTemplate(prompt, options, retry + 1)
+      }
+      throw error
+    }
+  }
+
+  private getSystemPrompt(options: GenerationOptions): string {
+    return `You are an expert Solana smart contract developer. Generate a complete, secure, and optimized smart contract based on the following requirements:
+
+- Security Level: ${options.security}
+- Optimization Level: ${options.optimization}
+- Testing Required: ${options.testing}
+
+Follow these guidelines:
+1. Use best practices for Solana program development
+2. Implement proper error handling
+3. Include input validation
+4. Add security checks
+5. Optimize for performance
+6. Follow Rust coding standards
+7. Add comprehensive comments
+8. Include proper documentation
+
+The response should be a complete contract template in JSON format with the following structure:
+{
+  "name": string,
+  "version": string,
+  "description": string,
+  "schemas": Array<SchemaDefinition>,
+  "instructions": Array<InstructionDefinition>,
+  "metadata": ContractMetadata
+}`
+  }
+
+  private parseTemplate(templateString: string): ContractTemplate {
+    try {
+      const template = JSON.parse(templateString)
+      this.validateTemplate(template)
+      return template
+    } catch (error) {
+      throw new Error(`Invalid template format: ${(error as Error).message}`)
+    }
+  }
+
+  private validateTemplate(template: any): void {
+    const requiredFields = ['name', 'version', 'description', 'schemas', 'instructions', 'metadata']
+    for (const field of requiredFields) {
+      if (!template[field]) {
+        throw new Error(`Missing required field: ${field}`)
+      }
     }
 
-    private async generateInitialCode(
-        prompt: string,
-        options: GenerationOptions
-    ): Promise<string> {
-        const completion = await this.openai.chat.completions.create({
-            model: options.model || this.DEFAULT_MODEL,
-            messages: [
-                {
-                    role: 'system',
-                    content: this.getSystemPrompt(options)
-                },
-                {
-                    role: 'user',
-                    content: prompt
-                }
-            ],
-            temperature: options.temperature || 0.7,
-            max_tokens: options.maxTokens || 2000,
-            presence_penalty: 0.6,
-            frequency_penalty: 0.3
-        });
-
-        return completion.choices[0]?.message?.content || '';
+    if (!Array.isArray(template.schemas) || template.schemas.length === 0) {
+      throw new Error('Template must include at least one schema')
     }
 
-    private async enhanceGeneratedCode(
-        code: string,
-        options: GenerationOptions
-    ): Promise<string> {
-        // Add security patterns
-        let enhancedCode = await this.addSecurityPatterns(code, options.securityLevel);
-
-        // Add test cases if requested
-        if (options.includeTests) {
-            enhancedCode = await this.addTestCases(enhancedCode);
-        }
-
-        // Optimize code
-        enhancedCode = await this.optimizeCode(enhancedCode, options.optimizationLevel);
-
-        return enhancedCode;
+    if (!Array.isArray(template.instructions) || template.instructions.length === 0) {
+      throw new Error('Template must include at least one instruction')
     }
+  }
 
-    private async addSecurityPatterns(
-        code: string,
-        securityLevel: GenerationOptions['securityLevel'] = 'standard'
-    ): Promise<string> {
-        const securityModule = this.securityGenerator.generateSecurityModule({
-            level: securityLevel,
-            includeReentrancyGuard: true,
-            includeAccessControl: true,
-            includeInputValidation: true
-        });
+  private needsReentrancyGuard(template: ContractTemplate): boolean {
+    return template.instructions.some(instruction =>
+      instruction.code.includes('invoke') ||
+      instruction.code.includes('transfer')
+    )
+  }
 
-        return this.codeGenerator.integrateSecurityPatterns(code, securityModule);
-    }
+  private needsAccessControl(template: ContractTemplate): boolean {
+    return template.instructions.some(instruction =>
+      instruction.code.includes('admin') ||
+      instruction.code.includes('owner') ||
+      instruction.code.includes('authority')
+    )
+  }
 
-    private async addTestCases(code: string): Promise<string> {
-        const testCases = await this.generateTestCases(code);
-        return `${code}\n\n${testCases}`;
-    }
+  private generateCacheKey(prompt: string, options: GenerationOptions): string {
+    const hash = require('crypto')
+      .createHash('sha256')
+      .update(`${prompt}${JSON.stringify(options)}`)
+      .digest('hex')
+    return `contract:${hash}`
+  }
 
-    private async optimizeCode(
-        code: string,
-        level: GenerationOptions['optimizationLevel'] = 'standard'
-    ): Promise<string> {
-        return this.codeGenerator.optimize(code, { level });
-    }
-
-    private async generateTestCases(code: string): Promise<string> {
-        const completion = await this.openai.chat.completions.create({
-            model: this.DEFAULT_MODEL,
-            messages: [
-                {
-                    role: 'system',
-                    content: 'Generate comprehensive test cases for the following Solana program code.'
-                },
-                {
-                    role: 'user',
-                    content: code
-                }
-            ],
-            temperature: 0.5,
-            max_tokens: 1000
-        });
-
-        return completion.choices[0]?.message?.content || '';
-    }
-
-    private getSystemPrompt(options: GenerationOptions): string {
-        return `You are an expert Solana smart contract developer. Generate secure, optimized, and well-documented Rust code for Solana programs.
-                Security Level: ${options.securityLevel || 'standard'}
-                Optimization Level: ${options.optimizationLevel || 'standard'}
-                
-                Include:
-                - Comprehensive error handling
-                - Input validation
-                - Access control
-                - Documentation and comments
-                - Security best practices
-                
-                Follow Solana program development guidelines and best practices.`;
-    }
-
-    private async checkConcurrencyLimit(): Promise<void> {
-        if (this.activeRequests >= this.MAX_CONCURRENT_REQUESTS) {
-            throw new AIServiceError(
-                'Too many concurrent requests',
-                { maxConcurrent: this.MAX_CONCURRENT_REQUESTS }
-            );
-        }
-    }
-
-    private async retryOperation<T>(
-        operation: () => Promise<T>,
-        errorMessage: string
-    ): Promise<T> {
-        let lastError: Error | null = null;
-
-        for (let attempt = 1; attempt <= this.MAX_RETRIES; attempt++) {
-            try {
-                return await operation();
-            } catch (error) {
-                lastError = error as Error;
-                if (attempt < this.MAX_RETRIES) {
-                    await new Promise(resolve => 
-                        setTimeout(resolve, this.RETRY_DELAY * attempt)
-                    );
-                }
-            }
-        }
-
-        throw new AIServiceError(
-            `${errorMessage}: ${lastError?.message}`,
-            { cause: lastError }
-        );
-    }
-
-    private handleError(error: any): Error {
-        if (error instanceof AIServiceError) {
-            return error;
-        }
-
-        if (error.response?.status === 429) {
-            return new AIServiceError('Rate limit exceeded, please try again later');
-        }
-
-        if (error.response?.status === 413) {
-            return new AIServiceError('Input too large');
-        }
-
-        return new AIServiceError(
-            'AI service error',
-            { cause: error }
-        );
-    }
-
-    public async validateGenerationCapability(): Promise<boolean> {
-        try {
-            await this.openai.models.list();
-            return true;
-        } catch {
-            return false;
-        }
-    }
-
-    public async cleanup(): Promise<void> {
-        this.removeAllListeners();
-    }
+  private recordMetrics(
+    startTime: number,
+    template: ContractTemplate,
+    analysis: AnalysisResult
+  ): void {
+    const duration = performance.now() - startTime
+    this.metrics.gauge('contract_generation_duration', duration)
+    this.metrics.gauge('contract_schema_count', template.schemas.length)
+    this.metrics.gauge('contract_instruction_count', template.instructions.length)
+    this.metrics.gauge('contract_security_score', analysis.metrics.securityScore)
+    this.metrics.increment('contract_generation_total')
+  }
 }
