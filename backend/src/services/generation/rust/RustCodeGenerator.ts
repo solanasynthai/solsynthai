@@ -1,245 +1,359 @@
-import { 
-    ProgramStructure, 
-    Instruction, 
-    Account, 
-    State,
-    SecurityProfile,
-    ValidationRule
-} from '../types';
-import { 
-    generateAccountStructs,
-    generateInstructions,
-    generateStateManagement,
-    generateSecurityModules
-} from './generators';
-import { RustFormatter } from './utils/RustFormatter';
-import { SecurityPatternGenerator } from './security/SecurityPatternGenerator';
-import { OptimizationEngine } from './optimization/OptimizationEngine';
+/**
+ * File: RustCodeGenerator.ts
+ * Location: /backend/src/services/generation/rust/RustCodeGenerator.ts
+ * Created: 2025-02-14 17:38:23 UTC
+ * Author: solanasynthai
+ */
+
+import { ContractSchema, InstructionTemplate, SecurityPatternGenerator } from '../../../types'
+import { logger, logError } from '../../../utils/logger'
+import { OptimizationLevel } from '../../../types'
+import * as rust_format from 'rustfmt-wasm'
+
+interface OptimizationOptions {
+  level: OptimizationLevel
+  inlineThreshold?: number
+  vectorizeLoops?: boolean
+  constPropagation?: boolean
+}
 
 export class RustCodeGenerator {
-    private formatter: RustFormatter;
-    private securityGenerator: SecurityPatternGenerator;
-    private optimizationEngine: OptimizationEngine;
+  private readonly SOLANA_VERSION = "1.16.0"
+  private readonly MAX_PROGRAM_SIZE = 1024 * 1024 // 1MB
+  private readonly securityGenerator: SecurityPatternGenerator
 
-    constructor() {
-        this.formatter = new RustFormatter();
-        this.securityGenerator = new SecurityPatternGenerator();
-        this.optimizationEngine = new OptimizationEngine();
+  constructor() {
+    this.securityGenerator = new SecurityPatternGenerator()
+  }
+
+  public async generate(
+    schema: ContractSchema,
+    instructions: InstructionTemplate[],
+    options: OptimizationOptions
+  ): Promise<string> {
+    try {
+      const startTime = Date.now()
+
+      // Generate code sections
+      const imports = this.generateImports()
+      const state = this.generateState(schema)
+      const instructionCode = this.generateInstructions(instructions)
+      const processor = this.generateProcessor(instructions)
+      const utils = this.generateUtils()
+
+      // Combine sections
+      let code = [
+        imports,
+        state,
+        instructionCode,
+        processor,
+        utils
+      ].join('\n\n')
+
+      // Apply optimizations
+      code = await this.optimize(code, options)
+
+      // Format code
+      code = await this.formatCode(code)
+
+      // Validate generated code
+      await this.validateCode(code)
+
+      logger.info('Rust code generation completed', {
+        duration: Date.now() - startTime,
+        codeSize: code.length,
+        instructionCount: instructions.length
+      })
+
+      return code
+
+    } catch (error) {
+      logError('Rust code generation failed', error as Error)
+      throw error
+    }
+  }
+
+  private generateImports(): string {
+    return `
+use solana_program::{
+    account_info::{next_account_info, AccountInfo},
+    entrypoint,
+    entrypoint::ProgramResult,
+    msg,
+    program_error::ProgramError,
+    pubkey::Pubkey,
+    program_pack::{Pack, Sealed},
+    system_instruction,
+    sysvar::{rent::Rent, Sysvar},
+};
+use borsh::{BorshDeserialize, BorshSerialize};
+use thiserror::Error;
+use std::convert::TryInto;
+
+// Declare program ID
+solana_program::declare_id!("So1SynTH5aiWKr2tW6YLxrzE6bHrRKgifQGdZhfsYVz");`
+  }
+
+  private generateState(schema: ContractSchema): string {
+    const fields = schema.fields.map(field => {
+      const rustType = this.getRustType(field.type)
+      return `    pub ${field.name}: ${rustType},`
+    }).join('\n')
+
+    return `
+#[derive(BorshSerialize, BorshDeserialize, Debug, Default, PartialEq)]
+pub struct ${schema.name} {
+${fields}
+}
+
+impl Sealed for ${schema.name} {}
+
+impl Pack for ${schema.name} {
+    const LEN: usize = ${schema.size};
+
+    fn pack_into_slice(&self, dst: &mut [u8]) {
+        let mut writer = std::io::Cursor::new(dst);
+        self.serialize(&mut writer).unwrap();
     }
 
-    public generateProgram(structure: ProgramStructure): string {
-        try {
-            // Generate program modules
-            const modules = this.generateProgramModules(structure);
-            
-            // Generate security features
-            const securityFeatures = this.generateSecurityFeatures(structure.securityProfile);
-            
-            // Combine and optimize
-            const combinedCode = this.combineModules(modules, securityFeatures);
-            
-            // Optimize the generated code
-            const optimizedCode = this.optimizationEngine.optimize(combinedCode);
-            
-            // Format the final code
-            return this.formatter.format(optimizedCode);
-        } catch (error) {
-            throw new Error(`Failed to generate Rust program: ${error.message}`);
-        }
+    fn unpack_from_slice(src: &[u8]) -> Result<Self, ProgramError> {
+        let mut reader = std::io::Cursor::new(src);
+        let result = Self::deserialize(&mut reader)
+            .map_err(|_| ProgramError::InvalidAccountData)?;
+        Ok(result)
+    }
+}`
+  }
+
+  private generateInstructions(instructions: InstructionTemplate[]): string {
+    return instructions.map(instruction => {
+      const args = instruction.args.map(arg => 
+        `    pub ${arg.name}: ${this.getRustType(arg.type)},`
+      ).join('\n')
+
+      return `
+#[derive(BorshSerialize, BorshDeserialize, Debug)]
+pub struct ${instruction.name}Instruction {
+${args}
+}
+
+impl ${instruction.name}Instruction {
+    pub fn process(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo],
+        instruction_data: &[u8]
+    ) -> ProgramResult {
+        let instruction = Self::try_from_slice(instruction_data)?;
+        ${this.generateSecurityChecks(instruction)}
+        ${instruction.code}
+        Ok(())
+    }
+}`
+    }).join('\n\n')
+  }
+
+  private generateProcessor(instructions: InstructionTemplate[]): string {
+    const instructionMatching = instructions.map((inst, index) => 
+      `        ${index} => ${inst.name}Instruction::process(program_id, accounts, instruction_data),`
+    ).join('\n')
+
+    return `
+entrypoint!(process_instruction);
+
+pub fn process_instruction(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    if instruction_data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
     }
 
-    private generateProgramModules(structure: ProgramStructure): string[] {
-        const modules: string[] = [];
+    let instruction = instruction_data[0];
+    let instruction_data = &instruction_data[1..];
 
-        // Generate program ID and version
-        modules.push(this.generateProgramDeclaration(structure));
+    match instruction {
+${instructionMatching}
+        _ => Err(ProgramError::InvalidInstructionData),
+    }
+}`
+  }
 
-        // Generate error handling
-        modules.push(this.generateErrorHandling(structure));
+  private generateUtils(): string {
+    return `
+#[derive(Error, Debug, Copy, Clone)]
+pub enum ContractError {
+    #[error("Invalid instruction")]
+    InvalidInstruction,
+    #[error("Account not initialized")]
+    NotInitialized,
+    #[error("Invalid account owner")]
+    InvalidOwner,
+    #[error("Insufficient funds")]
+    InsufficientFunds,
+    #[error("Account already initialized")]
+    AlreadyInitialized,
+}
 
-        // Generate account structures
-        modules.push(generateAccountStructs(structure.accounts));
+impl From<ContractError> for ProgramError {
+    fn from(e: ContractError) -> Self {
+        ProgramError::Custom(e as u32)
+    }
+}
 
-        // Generate program state
-        modules.push(generateStateManagement(structure.state));
+pub fn assert_owned_by(account: &AccountInfo, owner: &Pubkey) -> ProgramResult {
+    if account.owner != owner {
+        msg!("Account owner mismatch");
+        return Err(ContractError::InvalidOwner.into());
+    }
+    Ok(())
+}
 
-        // Generate instructions
-        modules.push(generateInstructions(structure.instructions));
+pub fn assert_initialized<T: Pack + Default>(
+    account_info: &AccountInfo,
+) -> Result<T, ProgramError> {
+    let account: T = T::unpack_unchecked(&account_info.data.borrow())?;
+    Ok(account)
+}
 
-        // Generate validation modules
-        modules.push(this.generateValidationModules(structure.validationRules));
+pub fn assert_uninitialized<T: Pack + Default>(
+    account_info: &AccountInfo,
+) -> ProgramResult {
+    if !(account_info.data.borrow().iter().all(|x| *x == 0)) {
+        return Err(ContractError::AlreadyInitialized.into());
+    }
+    Ok(())
+}
 
-        return modules;
+pub fn assert_signer(account_info: &AccountInfo) -> ProgramResult {
+    if !account_info.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    Ok(())
+}`
+  }
+
+  private getRustType(fieldType: string): string {
+    const typeMap: Record<string, string> = {
+      'u8': 'u8',
+      'u16': 'u16',
+      'u32': 'u32',
+      'u64': 'u64',
+      'i8': 'i8',
+      'i16': 'i16',
+      'i32': 'i32',
+      'i64': 'i64',
+      'f32': 'f32',
+      'f64': 'f64',
+      'bool': 'bool',
+      'string': 'String',
+      'pubkey': 'Pubkey',
+      'bytes': 'Vec<u8>'
+    }
+    return typeMap[fieldType] || fieldType
+  }
+
+  private generateSecurityChecks(instruction: InstructionTemplate): string {
+    return instruction.checks.map(check => {
+      switch (check.type) {
+        case 'ownership':
+          return `assert_owned_by(&accounts[${check.params.accountIndex}], program_id)?;`
+        case 'signer':
+          return `assert_signer(&accounts[${check.params.accountIndex}])?;`
+        case 'state':
+          return `assert_initialized(&accounts[${check.params.accountIndex}])?;`
+        default:
+          return ''
+      }
+    }).join('\n        ')
+  }
+
+  private async optimize(code: string, options: OptimizationOptions): Promise<string> {
+    let optimized = code
+
+    if (options.level === 'aggressive') {
+      // Inline small functions
+      if (options.inlineThreshold) {
+        optimized = this.inlineFunctions(optimized, options.inlineThreshold)
+      }
+
+      // Vectorize loops
+      if (options.vectorizeLoops) {
+        optimized = this.vectorizeLoops(optimized)
+      }
+
+      // Constant propagation
+      if (options.constPropagation) {
+        optimized = this.propagateConstants(optimized)
+      }
     }
 
-    private generateProgramDeclaration(structure: ProgramStructure): string {
-        return `
-            use anchor_lang::prelude::*;
-            use anchor_spl::token::{self, Token};
-            use std::convert::TryInto;
-            
-            declare_id!("${structure.programId}");
-            
-            #[program]
-            pub mod ${structure.name.toLowerCase()} {
-                use super::*;
-                
-                ${this.generateProgramMetadata(structure)}
-            }
-        `;
+    return optimized
+  }
+
+  private inlineFunctions(code: string, threshold: number): string {
+    // Implementation of function inlining optimization
+    const smallFunctionPattern = /fn\s+(\w+)\s*\([^)]*\)\s*->\s*[^{]*\{([^}]*)\}/g
+    return code.replace(smallFunctionPattern, (match, name, body) => {
+      if (body.length <= threshold) {
+        return `#[inline(always)]\n${match}`
+      }
+      return match
+    })
+  }
+
+  private vectorizeLoops(code: string): string {
+    // Implementation of loop vectorization
+    return code.replace(
+      /for\s+(\w+)\s+in\s+(\w+)\.iter\(\)/g,
+      'for $1 in $2.par_iter()'
+    )
+  }
+
+  private propagateConstants(code: string): string {
+    // Implementation of constant propagation
+    const constPattern = /const\s+(\w+):\s*(\w+)\s*=\s*([^;]+);/g
+    const constants = new Map<string, string>()
+    
+    code = code.replace(constPattern, (match, name, type, value) => {
+      constants.set(name, value.trim())
+      return match
+    })
+
+    for (const [name, value] of constants) {
+      code = code.replace(new RegExp(`\\b${name}\\b`, 'g'), value)
     }
 
-    private generateProgramMetadata(structure: ProgramStructure): string {
-        return `
-            const PROGRAM_VERSION: &str = "${structure.version}";
-            const PROGRAM_AUTHORITY: &str = "${structure.authority}";
-            
-            #[constant]
-            pub const PROGRAM_SEED: &[u8] = b"${structure.name.toLowerCase()}_program";
-        `;
+    return code
+  }
+
+  private async formatCode(code: string): Promise<string> {
+    try {
+      return await rust_format.format(code)
+    } catch (error) {
+      logger.warn('Failed to format Rust code', { error })
+      return code
+    }
+  }
+
+  private async validateCode(code: string): Promise<void> {
+    // Check program size
+    if (code.length > this.MAX_PROGRAM_SIZE) {
+      throw new Error(`Program size exceeds limit: ${code.length} bytes`)
     }
 
-    private generateErrorHandling(structure: ProgramStructure): string {
-        const errorCodes = this.extractErrorCodes(structure);
-        
-        return `
-            #[error_code]
-            pub enum ${structure.name}Error {
-                #[msg("Invalid program authority")]
-                InvalidAuthority,
-                
-                #[msg("Invalid account owner")]
-                InvalidOwner,
-                
-                #[msg("Invalid account data")]
-                InvalidAccountData,
-                
-                ${errorCodes.join(',\n')}
-            }
-        `;
-    }
+    // Check for common issues
+    const checks = [
+      { pattern: /unwrap\(\)/, message: 'Unsafe unwrap detected' },
+      { pattern: /panic!\(/, message: 'Panic macro detected' },
+      { pattern: /expect\(/, message: 'Unsafe expect detected' },
+      { pattern: /as\s+([ui]\d+)/, message: 'Unsafe type cast detected' }
+    ]
 
-    private generateValidationModules(rules: ValidationRule[]): string {
-        return `
-            pub mod validation {
-                use super::*;
-                
-                ${rules.map(rule => this.generateValidationRule(rule)).join('\n')}
-                
-                pub fn validate_program_access(program_id: &Pubkey) -> Result<()> {
-                    require!(
-                        *program_id == ID,
-                        ${structure.name}Error::InvalidProgramId
-                    );
-                    Ok(())
-                }
-                
-                pub fn validate_signer(signer: &Signer) -> Result<()> {
-                    require!(
-                        signer.is_signer,
-                        ${structure.name}Error::SignerRequired
-                    );
-                    Ok(())
-                }
-            }
-        `;
+    for (const check of checks) {
+      if (check.pattern.test(code)) {
+        logger.warn('Potential code issue detected', { issue: check.message })
+      }
     }
-
-    private generateValidationRule(rule: ValidationRule): string {
-        return `
-            pub fn ${rule.name}(${this.generateRuleParams(rule)}) -> Result<()> {
-                require!(
-                    ${rule.condition},
-                    ${structure.name}Error::${rule.errorCode}
-                );
-                Ok(())
-            }
-        `;
-    }
-
-    private generateSecurityFeatures(profile: SecurityProfile): string {
-        return `
-            pub mod security {
-                use super::*;
-                
-                ${this.securityGenerator.generateReentrancyGuard()}
-                ${this.securityGenerator.generateAccessControl(profile)}
-                ${this.securityGenerator.generateProgramGuard()}
-                
-                pub fn initialize_security(ctx: Context<SecurityContext>) -> Result<()> {
-                    let clock = Clock::get()?;
-                    ctx.accounts.security.is_initialized = true;
-                    ctx.accounts.security.last_update = clock.unix_timestamp;
-                    ctx.accounts.security.authority = ctx.accounts.authority.key();
-                    Ok(())
-                }
-            }
-        `;
-    }
-
-    private combineModules(modules: string[], securityFeatures: string): string {
-        return `
-            ${this.generateLicenseAndDocumentation()}
-            
-            ${modules.join('\n\n')}
-            
-            ${securityFeatures}
-            
-            ${this.generateTestModule()}
-        `;
-    }
-
-    private generateLicenseAndDocumentation(): string {
-        return `
-            //! ${structure.name} Program
-            //! Version: ${structure.version}
-            //! 
-            //! This program was generated by the Solana AI Contract Generator
-            //! 
-            //! SPDX-License-Identifier: Apache-2.0
-            
-            #![deny(missing_docs)]
-            #![deny(warnings)]
-            #![deny(unsafe_code)]
-        `;
-    }
-
-    private generateTestModule(): string {
-        return `
-            #[cfg(test)]
-            mod tests {
-                use super::*;
-                use anchor_lang::solana_program::program_pack::Pack;
-                use anchor_lang::solana_program::system_instruction;
-                
-                #[test]
-                fn test_initialization() {
-                    // Test implementation
-                }
-            }
-        `;
-    }
-
-    private extractErrorCodes(structure: ProgramStructure): string[] {
-        const errorCodes = new Set<string>();
-        
-        // Extract from instructions
-        structure.instructions.forEach(instruction => {
-            instruction.errors.forEach(error => {
-                errorCodes.add(this.formatErrorCode(error));
-            });
-        });
-        
-        // Extract from validation rules
-        structure.validationRules.forEach(rule => {
-            errorCodes.add(this.formatErrorCode(rule.error));
-        });
-        
-        return Array.from(errorCodes);
-    }
-
-    private formatErrorCode(error: string): string {
-        return `#[msg("${error}")]
-                ${error.replace(/\s+/g, '')}`;
-    }
+  }
 }
