@@ -1,10 +1,3 @@
-/**
- * File: SecurityPatternGenerator.ts
- * Location: /backend/src/services/generation/rust/security/SecurityPatternGenerator.ts
- * Created: 2025-02-14 17:40:14 UTC
- * Author: solanasynthai
- */
-
 import { SecurityCheck, ContractTemplate, ValidationError } from '../../../../types'
 import { logger, logError } from '../../../../utils/logger'
 
