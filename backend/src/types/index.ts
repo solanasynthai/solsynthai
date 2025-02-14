@@ -1,260 +1,326 @@
-import { PublicKey, TransactionInstruction, Keypair } from '@solana/web3.js'
-import { BN } from 'bn.js'
+import { WebSocket } from 'ws'
+import { Request } from 'express'
 
-// Contract Types
-export interface ContractTemplate {
-  name: string
-  version: string
-  description: string
-  schemas: ContractSchema[]
-  instructions: InstructionTemplate[]
-  metadata: ContractMetadata
+// Database Models
+export interface User {
+  id: string
+  username: string
+  email: string
+  password_hash: string
+  role: UserRole
+  created_at: Date
+  updated_at: Date
+  last_login_at: Date | null
+  is_active: boolean
+  is_email_verified: boolean
+  verification_token?: string
+  reset_token?: string
+  reset_token_expires_at?: Date
 }
 
-export interface ContractSchema {
+export interface Contract {
+  id: string
   name: string
-  version: number
-  fields: SchemaField[]
-  size: number
-  discriminator?: number
-}
-
-export interface SchemaField {
-  name: string
-  type: FieldType
-  size: number
-  offset: number
-  isOptional: boolean
-  validator?: FieldValidator
-}
-
-export type FieldType =
-  | 'u8'
-  | 'u16'
-  | 'u32'
-  | 'u64'
-  | 'i8'
-  | 'i16'
-  | 'i32'
-  | 'i64'
-  | 'f32'
-  | 'f64'
-  | 'bool'
-  | 'string'
-  | 'pubkey'
-  | 'bytes'
-  | Array<FieldType>
-  | { enum: string[] }
-  | { struct: SchemaField[] }
-
-export interface FieldValidator {
-  type: 'range' | 'regex' | 'enum' | 'custom'
-  params: Record<string, any>
-  message: string
-}
-
-// Instruction Types
-export interface InstructionTemplate {
-  name: string
-  accounts: AccountMeta[]
-  args: ArgumentTemplate[]
+  description?: string
+  author_id: string
   code: string
-  checks: SecurityCheck[]
+  status: ContractStatus
+  security_level: SecurityLevel
+  optimization_level: OptimizationLevel
+  version: string
+  is_template: boolean
+  created_at: Date
+  updated_at: Date
+  published_at?: Date
+  compilation_result?: CompilationResult
+  analysis_result?: AnalysisResult
+  metadata?: Record<string, unknown>
 }
 
-export interface AccountMeta {
-  name: string
-  isSigner: boolean
-  isWritable: boolean
-  isPda: boolean
-  seeds?: PdaSeed[]
+export interface ContractVersion {
+  id: string
+  contract_id: string
+  version: string
+  code: string
+  commit_message?: string
+  created_at: Date
+  author_id: string
+  compilation_result?: CompilationResult
+  analysis_result?: AnalysisResult
 }
 
-export interface ArgumentTemplate {
-  name: string
-  type: FieldType
-  validator?: FieldValidator
+export interface ContractAudit {
+  id: string
+  contract_id: string
+  auditor_id: string
+  version: string
+  status: AuditStatus
+  findings: AuditFinding[]
+  started_at: Date
+  completed_at?: Date
+  report?: string
+  severity_score: number
 }
 
-export interface SecurityCheck {
-  type: SecurityCheckType
-  params: Record<string, any>
-  severity: 'low' | 'medium' | 'high' | 'critical'
-}
-
-export type SecurityCheckType =
-  | 'ownership'
-  | 'signer'
-  | 'state'
-  | 'reentrancy'
-  | 'arithmetic'
-  | 'access'
-
-// PDA Types
-export interface PdaSeed {
-  type: FieldType
-  path?: string
-  value?: string | number | Buffer
-}
-
-export interface PdaInfo {
-  publicKey: PublicKey
-  bump: number
-  seeds: Buffer[]
-}
-
-// State Management
-export interface AccountState {
-  pubkey: PublicKey
-  data: Buffer
-  owner: PublicKey
-  executable: boolean
-  lamports: number
-  rentEpoch: number
-  metadata: AccountMetadata
-}
-
-export interface AccountMetadata {
-  schemaName: string
-  schemaVersion: number
-  lastUpdate: number
-  authority: PublicKey
-}
-
-// Transaction Types
-export interface TransactionContext {
-  instructions: TransactionInstruction[]
-  signers: Keypair[]
-  feePayer: PublicKey
-  metadata: TransactionMetadata
-}
-
-export interface TransactionMetadata {
+// WebSocket Message Types
+export interface WSMessage {
+  type: WSMessageType
+  payload: unknown
   id: string
   timestamp: number
-  origin: string
-  priority?: 'low' | 'medium' | 'high'
 }
 
-// Event Types
-export interface ContractEvent {
-  type: string
-  data: Record<string, any>
-  slot: number
-  timestamp: number
-  signature?: string
+export interface WSContractUpdateMessage extends WSMessage {
+  type: 'CONTRACT_UPDATE'
+  payload: {
+    contractId: string
+    status: ContractStatus
+    changes: Partial<Contract>
+  }
 }
 
-// Error Types
-export interface ValidationError {
-  field?: string
-  code: string
-  message: string
-  severity: 'low' | 'medium' | 'high' | 'critical'
-  metadata?: Record<string, any>
+export interface WSAnalysisResultMessage extends WSMessage {
+  type: 'ANALYSIS_RESULT'
+  payload: {
+    contractId: string
+    result: AnalysisResult
+  }
 }
 
-// Analysis Types
-export interface AnalysisResult {
+export interface WSCompilationResultMessage extends WSMessage {
+  type: 'COMPILATION_RESULT'
+  payload: {
+    contractId: string
+    result: CompilationResult
+  }
+}
+
+export interface WSErrorMessage extends WSMessage {
+  type: 'ERROR'
+  payload: {
+    code: string
+    message: string
+    details?: unknown
+  }
+}
+
+// WebSocket Client Type
+export interface WSClient {
+  id: string
+  ws: WebSocket
+  userId: string
+  subscriptions: Set<string>
+  lastPing: number
+}
+
+// Service Interfaces
+export interface IAnalyzerService {
+  analyzeContract(code: string, options: AnalysisOptions): Promise<AnalysisResult>
+  validateSyntax(code: string): Promise<ValidationResult>
+  checkSecurityPatterns(code: string): Promise<SecurityCheckResult>
+}
+
+export interface ITemplateService {
+  generateFromPrompt(prompt: string, options: TemplateOptions): Promise<string>
+  loadTemplate(name: string): Promise<string>
+  saveTemplate(name: string, code: string): Promise<void>
+}
+
+export interface ICacheService {
+  get<T>(key: string): Promise<T | null>
+  set<T>(key: string, value: T, ttl?: number): Promise<void>
+  del(key: string): Promise<void>
+  flush(): Promise<void>
+}
+
+// Request Extensions
+export interface AuthenticatedRequest extends Request {
+  user: User
+  sessionId: string
+}
+
+// Enums
+export enum UserRole {
+  ADMIN = 'admin',
+  DEVELOPER = 'developer',
+  AUDITOR = 'auditor'
+}
+
+export enum ContractStatus {
+  DRAFT = 'draft',
+  REVIEWING = 'reviewing',
+  PUBLISHED = 'published',
+  ARCHIVED = 'archived'
+}
+
+export enum SecurityLevel {
+  LOW = 'low',
+  MEDIUM = 'medium',
+  HIGH = 'high'
+}
+
+export enum OptimizationLevel {
+  LOW = 'low',
+  MEDIUM = 'medium',
+  HIGH = 'high'
+}
+
+export enum AuditStatus {
+  PENDING = 'pending',
+  IN_PROGRESS = 'in_progress',
+  COMPLETED = 'completed',
+  FAILED = 'failed'
+}
+
+export enum WSMessageType {
+  CONTRACT_UPDATE = 'CONTRACT_UPDATE',
+  ANALYSIS_RESULT = 'ANALYSIS_RESULT',
+  COMPILATION_RESULT = 'COMPILATION_RESULT',
+  ERROR = 'ERROR'
+}
+
+// Result Types
+export interface ValidationResult {
+  isValid: boolean
   errors: ValidationError[]
-  warnings: ValidationError[]
-  metrics: AnalysisMetrics
-  timestamp: number
+  warnings: ValidationWarning[]
 }
 
-export interface AnalysisMetrics {
-  codeSize: number
-  complexity: number
-  coverage: number
+export interface SecurityCheckResult {
+  score: number
+  vulnerabilities: Vulnerability[]
+  recommendations: Recommendation[]
+}
+
+export interface CompilationResult {
+  success: boolean
+  bytecode?: string
+  abi?: unknown[]
+  errors?: CompilationError[]
+  warnings?: CompilationWarning[]
+  gasEstimates?: GasEstimates
+}
+
+export interface AnalysisResult {
   securityScore: number
-}
-
-// Generation Types
-export interface GenerationOptions {
-  template: ContractTemplate
-  optimization: OptimizationLevel
-  security: SecurityLevel
-  testing: boolean
-}
-
-export type OptimizationLevel = 'none' | 'basic' | 'aggressive'
-export type SecurityLevel = 'basic' | 'standard' | 'high'
-
-// Migration Types
-export interface MigrationPlan {
-  source: ContractSchema
-  target: ContractSchema
-  steps: MigrationStep[]
-  estimatedGas: BN
-}
-
-export interface MigrationStep {
-  type: 'add' | 'remove' | 'modify' | 'reorder'
-  field: string
-  details: Record<string, any>
-}
-
-// Monitoring Types
-export interface HealthCheck {
-  status: 'healthy' | 'degraded' | 'failed'
-  checks: HealthCheckResult[]
-  timestamp: number
-}
-
-export interface HealthCheckResult {
-  name: string
-  status: 'pass' | 'warn' | 'fail'
-  duration: number
-  message?: string
-}
-
-// Service Types
-export interface ServiceConfig {
-  enabled: boolean
-  maxRetries: number
-  timeout: number
-  rateLimits: RateLimits
-}
-
-export interface RateLimits {
-  points: number
-  duration: number
-  blockDuration: number
+  optimizationScore: number
+  vulnerabilities: Vulnerability[]
+  suggestions: Suggestion[]
+  metrics: CodeMetrics
 }
 
 // Utility Types
-export type DeepPartial<T> = {
-  [P in keyof T]?: T[P] extends object ? DeepPartial<T[P]> : T[P]
+export interface ValidationError {
+  code: string
+  message: string
+  line?: number
+  column?: number
+  severity: 'error'
 }
 
-export type ValidationResult<T> = {
-  isValid: boolean
-  errors: ValidationError[]
-  value: T | null
+export interface ValidationWarning {
+  code: string
+  message: string
+  line?: number
+  column?: number
+  severity: 'warning'
 }
 
-export type AsyncResult<T> = Promise<{
-  success: boolean
-  data?: T
-  error?: Error
-}>
-
-// User defined type guards
-export function isContractTemplate(value: any): value is ContractTemplate {
-  return (
-    value &&
-    typeof value.name === 'string' &&
-    typeof value.version === 'string' &&
-    Array.isArray(value.schemas) &&
-    Array.isArray(value.instructions)
-  )
+export interface Vulnerability {
+  id: string
+  name: string
+  description: string
+  severity: 'low' | 'medium' | 'high' | 'critical'
+  location: CodeLocation
+  cweId?: string
+  fix?: string
 }
 
-export function isValidationError(value: any): value is ValidationError {
-  return (
-    value &&
-    typeof value.code === 'string' &&
-    typeof value.message === 'string' &&
-    typeof value.severity === 'string'
-  )
+export interface Recommendation {
+  id: string
+  title: string
+  description: string
+  priority: 'low' | 'medium' | 'high'
+  impact: string
+  effort: string
+  code?: string
+}
+
+export interface CompilationError {
+  code: string
+  message: string
+  location?: CodeLocation
+  severity: 'error'
+}
+
+export interface CompilationWarning {
+  code: string
+  message: string
+  location?: CodeLocation
+  severity: 'warning'
+}
+
+export interface GasEstimates {
+  deployment: number
+  methods: Record<string, number>
+}
+
+export interface CodeMetrics {
+  linesOfCode: number
+  cyclomaticComplexity: number
+  halsteadDifficulty: number
+  maintainabilityIndex: number
+  testCoverage?: number
+}
+
+export interface CodeLocation {
+  file: string
+  line: number
+  column: number
+  length?: number
+}
+
+export interface AuditFinding {
+  id: string
+  title: string
+  description: string
+  severity: 'low' | 'medium' | 'high' | 'critical'
+  category: string
+  location?: CodeLocation
+  recommendation?: string
+  references?: string[]
+}
+
+// Configuration Types
+export interface AnalysisOptions {
+  securityLevel: SecurityLevel
+  optimizationLevel: OptimizationLevel
+  includeGasAnalysis?: boolean
+  includeTestCoverage?: boolean
+}
+
+export interface TemplateOptions {
+  language: 'rust' | 'typescript'
+  framework?: string
+  securityLevel: SecurityLevel
+  optimizationLevel: OptimizationLevel
+  includeTests?: boolean
+}
+
+// Export all types
+export type {
+  User,
+  Contract,
+  ContractVersion,
+  ContractAudit,
+  WSMessage,
+  WSContractUpdateMessage,
+  WSAnalysisResultMessage,
+  WSCompilationResultMessage,
+  WSErrorMessage,
+  WSClient,
+  IAnalyzerService,
+  ITemplateService,
+  ICacheService,
+  AuthenticatedRequest
 }
