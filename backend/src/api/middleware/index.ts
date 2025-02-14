@@ -1,280 +1,257 @@
 import { Request, Response, NextFunction } from 'express'
-import { validationResult } from 'express-validator'
-import helmet from 'helmet'
-import cors from 'cors'
+import { PoolClient } from 'pg'
 import rateLimit from 'express-rate-limit'
+import Joi from 'joi'
+import { DatabaseService } from '../../services/database/DatabaseService'
 import { AuthenticationService } from '../../services/security/AuthenticationService'
 import { MetricsService } from '../../services/monitoring/MetricsService'
-import { CacheService } from '../../services/cache/CacheService'
-import { AuthenticationError, ValidationError } from '../../utils/errors'
 import { logger, logError } from '../../utils/logger'
+import { AuthError, ValidationError } from '../../utils/errors'
 import config from '../../config/config'
+import { UserRole, AuthenticatedRequest } from '../../types'
 
-const auth = AuthenticationService.getInstance()
+const db = DatabaseService.getInstance()
 const metrics = MetricsService.getInstance()
-const cache = CacheService.getInstance()
+const auth = AuthenticationService.getInstance()
 
-// Security middleware
-export const security = [
-  helmet({
-    contentSecurityPolicy: config.security_headers.cspEnabled ? {
-      directives: {
-        defaultSrc: ["'self'"],
-        scriptSrc: ["'self'", "'unsafe-inline'"],
-        styleSrc: ["'self'", "'unsafe-inline'"],
-        imgSrc: ["'self'", 'data:', 'https:'],
-        connectSrc: ["'self'", config.solana.rpcUrl],
-        frameSrc: ["'none'"],
-        objectSrc: ["'none'"],
-        upgradeInsecureRequests: []
+// Rate Limiting Middleware
+export const rateLimiter = rateLimit({
+  windowMs: config.security.rateLimiter.windowMs,
+  max: config.security.rateLimiter.max,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => config.security.ipWhitelist.includes(req.ip),
+  handler: (req, res) => {
+    metrics.incrementCounter('rate_limit_exceeded_total')
+    res.status(429).json({
+      error: 'Too many requests',
+      retryAfter: Math.ceil(config.security.rateLimiter.windowMs / 1000),
+    })
+  },
+})
+
+// Transaction Middleware
+export const withTransaction = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  const transactionClient: PoolClient = await db.pool.connect()
+  
+  try {
+    await transactionClient.query('BEGIN')
+    res.locals.transactionClient = transactionClient
+    
+    res.on('finish', async () => {
+      if (res.statusCode < 400) {
+        await transactionClient.query('COMMIT')
+        metrics.incrementCounter('transaction_commits_total')
+      } else {
+        await transactionClient.query('ROLLBACK')
+        metrics.incrementCounter('transaction_rollbacks_total')
       }
-    } : false,
-    hsts: {
-      maxAge: 31536000,
-      includeSubDomains: true,
-      preload: true
-    },
-    referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
-    noSniff: true,
-    hidePoweredBy: true,
-    xssFilter: true
-  }),
-  cors({
-    origin: config.app.corsOrigin,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-    credentials: true,
-    maxAge: 86400 // 24 hours
-  })
-]
+      transactionClient.release()
+    })
+    
+    next()
+  } catch (error) {
+    await transactionClient.query('ROLLBACK')
+    transactionClient.release()
+    metrics.incrementCounter('transaction_errors_total')
+    next(error)
+  }
+}
 
-// Authentication middleware
+// Validation Schemas
+export const schemas = {
+  user: {
+    create: Joi.object({
+      username: Joi.string().alphanum().min(3).max(30).required(),
+      email: Joi.string().email().required(),
+      password: Joi.string().min(8).max(100).required(),
+      role: Joi.string().valid(...Object.values(UserRole)),
+    }),
+    update: Joi.object({
+      username: Joi.string().alphanum().min(3).max(30),
+      email: Joi.string().email(),
+      role: Joi.string().valid(...Object.values(UserRole)),
+    }),
+  },
+  contract: {
+    create: Joi.object({
+      name: Joi.string().min(1).max(100).required(),
+      description: Joi.string().max(1000),
+      code: Joi.string().required(),
+      securityLevel: Joi.string().required(),
+      optimizationLevel: Joi.string().required(),
+    }),
+    update: Joi.object({
+      name: Joi.string().min(1).max(100),
+      description: Joi.string().max(1000),
+      code: Joi.string(),
+      status: Joi.string(),
+      securityLevel: Joi.string(),
+      optimizationLevel: Joi.string(),
+    }),
+  },
+  auth: {
+    login: Joi.object({
+      email: Joi.string().email().required(),
+      password: Joi.string().required(),
+    }),
+    refresh: Joi.object({
+      refreshToken: Joi.string().required(),
+    }),
+  },
+}
+
+// Validation Middleware
+export const validate = (schema: Joi.Schema) => {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    const { error } = schema.validate(req.body, { abortEarly: false })
+    
+    if (error) {
+      metrics.incrementCounter('validation_errors_total')
+      throw new ValidationError('Invalid request data', {
+        details: error.details.map(detail => ({
+          message: detail.message,
+          path: detail.path,
+        })),
+      })
+    }
+    
+    next()
+  }
+}
+
+// Authentication Middleware
 export const authenticate = async (
   req: Request,
   res: Response,
   next: NextFunction
 ): Promise<void> => {
-  const startTime = performance.now()
-
   try {
-    const authHeader = req.headers.authorization
-    if (!authHeader) {
-      throw new AuthenticationError('No authorization header')
+    const token = req.headers.authorization?.split(' ')[1]
+    if (!token) {
+      throw new AuthError('No token provided')
     }
 
-    const [type, token] = authHeader.split(' ')
-    if (type !== 'Bearer' || !token) {
-      throw new AuthenticationError('Invalid authorization header')
-    }
+    const decoded = await auth.verifyToken(token)
+    ;(req as AuthenticatedRequest).user = decoded.user
+    ;(req as AuthenticatedRequest).sessionId = decoded.sessionId
 
-    const payload = await auth.validateToken(token)
-    req.user = payload
-
-    metrics.gauge('auth_middleware_duration', performance.now() - startTime)
+    metrics.incrementCounter('successful_auth_total')
     next()
-
   } catch (error) {
-    metrics.increment('auth_failures_total')
-    logError('Authentication failed', error as Error)
-    next(error)
+    metrics.incrementCounter('failed_auth_total')
+    next(new AuthError('Authentication failed', { cause: error }))
   }
 }
 
-// Request validation middleware
-export const validateRequest = (
-  req: Request,
-  res: Response,
-  next: NextFunction
-): void => {
-  const errors = validationResult(req)
-  if (!errors.isEmpty()) {
-    throw new ValidationError('Invalid request parameters', {
-      errors: errors.array()
-    })
+// Role Authorization Middleware
+export const authorize = (roles: UserRole[]) => {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    const user = (req as AuthenticatedRequest).user
+    
+    if (!roles.includes(user.role)) {
+      metrics.incrementCounter('authorization_denied_total')
+      throw new AuthError('Insufficient permissions')
+    }
+    
+    metrics.incrementCounter('authorization_granted_total')
+    next()
   }
-  next()
 }
 
-// Rate limiting middleware factory
-export const createRateLimiter = (options: {
-  windowMs: number
-  max: number
-  keyGenerator?: (req: Request) => string
-}) => {
-  return rateLimit({
-    windowMs: options.windowMs,
-    max: options.max,
-    keyGenerator: options.keyGenerator || ((req) => req.ip),
-    handler: (req, res) => {
-      metrics.increment('rate_limit_exceeded_total')
-      res.status(429).json({
-        error: 'Too many requests',
-        retryAfter: Math.ceil(options.windowMs / 1000)
-      })
-    },
-    skip: (req) => req.method === 'OPTIONS'
-  })
-}
-
-// Request logging middleware
-export const requestLogger = (
-  req: Request,
-  res: Response,
-  next: NextFunction
-): void => {
-  const startTime = performance.now()
-
-  res.on('finish', () => {
-    const duration = performance.now() - startTime
-    const status = res.statusCode
-
-    logger.info('Request completed', {
-      method: req.method,
-      path: req.path,
-      status,
-      duration,
-      ip: req.ip,
-      userAgent: req.get('user-agent')
-    })
-
-    metrics.gauge('http_request_duration', duration)
-    metrics.increment('http_requests_total', {
-      method: req.method,
-      path: req.path,
-      status: status.toString()
-    })
-  })
-
-  next()
-}
-
-// Error handling middleware
+// Error Handling Middleware
 export const errorHandler = (
   error: Error,
   req: Request,
   res: Response,
   next: NextFunction
 ): void => {
-  logError('Request error', error)
-
-  metrics.increment('errors_total', {
-    type: error.constructor.name
-  })
+  logError('API Error', error)
+  metrics.incrementCounter('api_errors_total', { type: error.constructor.name })
 
   if (error instanceof ValidationError) {
     res.status(400).json({
       error: 'Validation Error',
-      details: error.details
+      details: error.details,
     })
     return
   }
 
-  if (error instanceof AuthenticationError) {
+  if (error instanceof AuthError) {
     res.status(401).json({
       error: 'Authentication Error',
-      message: error.message
+      message: error.message,
     })
     return
   }
 
-  // Generic error response
   res.status(500).json({
     error: 'Internal Server Error',
-    requestId: req.id
+    requestId: req.id,
   })
 }
 
-// Cache middleware factory
-export const cacheMiddleware = (options: {
-  duration: number
-  key?: (req: Request) => string
-}) => {
-  return async (
-    req: Request,
-    res: Response,
-    next: NextFunction
-  ): Promise<void> => {
-    if (req.method !== 'GET') {
-      next()
-      return
-    }
-
-    const key = options.key?.(req) || `cache:${req.originalUrl}`
-
-    try {
-      const cached = await cache.get(key)
-      if (cached) {
-        metrics.increment('cache_hits_total')
-        res.json(cached)
-        return
-      }
-
-      const originalJson = res.json.bind(res)
-      res.json = (body: any) => {
-        cache.set(key, body, options.duration)
-          .catch(error => logError('Cache set failed', error))
-        return originalJson(body)
-      }
-
-      metrics.increment('cache_misses_total')
-      next()
-
-    } catch (error) {
-      logError('Cache middleware error', error as Error)
-      next()
-    }
-  }
-}
-
-// Request ID middleware
-export const requestId = (
+// Request Logging Middleware
+export const requestLogger = (
   req: Request,
   res: Response,
   next: NextFunction
 ): void => {
-  req.id = require('crypto').randomBytes(16).toString('hex')
-  res.setHeader('X-Request-ID', req.id)
-  next()
-}
-
-// Response time header middleware
-export const responseTime = (
-  req: Request,
-  res: Response,
-  next: NextFunction
-): void => {
-  const startTime = process.hrtime()
+  const start = Date.now()
 
   res.on('finish', () => {
-    const [seconds, nanoseconds] = process.hrtime(startTime)
-    const duration = seconds * 1000 + nanoseconds / 1000000
-    res.setHeader('X-Response-Time', `${duration.toFixed(2)}ms`)
+    const duration = Date.now() - start
+    metrics.recordHistogram('request_duration_seconds', duration / 1000)
+
+    logger.info('API Request', {
+      method: req.method,
+      path: req.path,
+      status: res.statusCode,
+      duration,
+      ip: req.ip,
+      user: (req as AuthenticatedRequest).user?.id,
+    })
   })
 
   next()
 }
 
-// Compression middleware configuration
-export const compressionOptions = {
-  filter: (req: Request, res: Response) => {
-    if (req.headers['x-no-compression']) {
-      return false
-    }
-    return true
-  },
-  threshold: 1024 // 1KB
+// Metrics Middleware
+export const metricsMiddleware = (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): void => {
+  metrics.incrementCounter('http_requests_total', {
+    method: req.method,
+    path: req.route?.path || 'unknown',
+  })
+
+  const start = Date.now()
+  res.on('finish', () => {
+    const duration = Date.now() - start
+    metrics.recordHistogram('http_request_duration_seconds', duration / 1000, {
+      method: req.method,
+      path: req.route?.path || 'unknown',
+      status: res.statusCode.toString(),
+    })
+  })
+
+  next()
 }
 
-// Export all middlewares
 export default {
-  security,
+  rateLimiter,
+  withTransaction,
+  validate,
   authenticate,
-  validateRequest,
-  createRateLimiter,
-  requestLogger,
+  authorize,
   errorHandler,
-  cacheMiddleware,
-  requestId,
-  responseTime,
-  compressionOptions
+  requestLogger,
+  metricsMiddleware,
+  schemas,
 }
