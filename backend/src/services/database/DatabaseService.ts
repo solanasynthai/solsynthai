@@ -1,39 +1,30 @@
 import { Pool, PoolClient, QueryResult } from 'pg'
-import { DatabaseError } from '../../utils/errors'
-import { logger, logError } from '../../utils/logger'
-import { MetricsService } from '../monitoring/MetricsService'
+import { promisify } from 'util'
 import config from '../../config/config'
+import { logger, logError } from '../../utils/logger'
+import { DatabaseError } from '../../utils/errors'
+import { MetricsService } from '../monitoring/MetricsService'
 
 export class DatabaseService {
   private static instance: DatabaseService
   private pool: Pool
   private metrics: MetricsService
-  private isConnected: boolean = false
-
-  private readonly MAX_POOL_SIZE = 20
-  private readonly IDLE_TIMEOUT = 10000
-  private readonly CONNECTION_TIMEOUT = 5000
-  private readonly MAX_RETRIES = 3
-  private readonly RETRY_DELAY = 1000
+  private readonly maxRetries = 3
+  private readonly retryDelay = 1000 // 1 second
 
   private constructor() {
     this.pool = new Pool({
-      host: config.database.host,
-      port: config.database.port,
-      database: config.database.name,
-      user: config.database.user,
-      password: config.database.password,
-      max: this.MAX_POOL_SIZE,
-      idleTimeoutMillis: this.IDLE_TIMEOUT,
-      connectionTimeoutMillis: this.CONNECTION_TIMEOUT,
-      ssl: process.env.NODE_ENV === 'production' ? {
-        rejectUnauthorized: true,
-        ca: process.env.DB_CA_CERT
-      } : undefined
+      ...config.database,
+      application_name: config.app.name,
+      statement_timeout: 30000, // 30 seconds
+      query_timeout: 30000,
+      connectionTimeoutMillis: config.database.pool.connectionTimeoutMillis,
+      idleTimeoutMillis: config.database.pool.idleTimeoutMillis,
+      max: config.database.pool.max,
     })
 
     this.metrics = MetricsService.getInstance()
-    this.setupEventHandlers()
+    this.setupPoolEvents()
   }
 
   public static getInstance(): DatabaseService {
@@ -43,124 +34,108 @@ export class DatabaseService {
     return DatabaseService.instance
   }
 
-  public async connect(): Promise<void> {
-    if (this.isConnected) return
+  private setupPoolEvents(): void {
+    this.pool.on('connect', (client: PoolClient) => {
+      this.metrics.incrementCounter('db_connections_total')
+      logger.debug('New database connection established', {
+        pid: client.processID,
+        database: config.database.database,
+      })
+    })
 
+    this.pool.on('error', (err: Error, client: PoolClient) => {
+      logError('Unexpected database error on idle client', err)
+      this.metrics.incrementCounter('db_errors_total')
+    })
+
+    this.pool.on('remove', (client: PoolClient) => {
+      logger.debug('Database connection removed from pool', {
+        pid: client.processID,
+      })
+    })
+  }
+
+  public async connect(): Promise<void> {
     try {
       const client = await this.pool.connect()
       client.release()
-      this.isConnected = true
-      logger.info('Database connection established')
-      this.metrics.gauge('database_connections', this.pool.totalCount)
+      logger.info('Database connection pool initialized', {
+        host: config.database.host,
+        database: config.database.database,
+        maxConnections: config.database.pool.max,
+      })
     } catch (error) {
-      logError('Database connection failed', error as Error)
-      throw new DatabaseError('Failed to connect to database')
+      logError('Failed to initialize database connection pool', error as Error)
+      throw new DatabaseError('Database connection failed', { cause: error })
     }
   }
 
   public async disconnect(): Promise<void> {
-    if (!this.isConnected) return
-
     try {
       await this.pool.end()
-      this.isConnected = false
-      logger.info('Database connection closed')
+      logger.info('Database connection pool closed')
     } catch (error) {
-      logError('Database disconnection failed', error as Error)
-      throw new DatabaseError('Failed to disconnect from database')
+      logError('Error closing database connection pool', error as Error)
+      throw new DatabaseError('Database disconnection failed', { cause: error })
     }
   }
 
   public async query<T>(
-    sql: string,
-    params?: any[],
-    options: {
-      usePrepared?: boolean;
-      useTransaction?: boolean;
-    } = {}
+    text: string,
+    params?: unknown[],
+    options: { retry?: boolean; timeout?: number } = {}
   ): Promise<QueryResult<T>> {
-    const startTime = performance.now()
+    const start = Date.now()
+    let retries = 0
 
-    try {
-      if (!this.isConnected) {
-        await this.connect()
-      }
-
-      let client: PoolClient | null = null
-      let result: QueryResult<T>
-
-      if (options.useTransaction) {
-        client = await this.pool.connect()
-        await client.query('BEGIN')
-      }
-
+    while (true) {
       try {
-        if (options.usePrepared) {
-          const preparedName = this.generatePreparedName(sql)
-          await this.prepareStatement(preparedName, sql)
-          result = await (client || this.pool).query({
-            name: preparedName,
-            text: sql,
-            values: params
-          })
-        } else {
-          result = await (client || this.pool).query(sql, params)
-        }
+        const result = await this.pool.query<T>(text, params)
+        
+        // Record metrics
+        const duration = Date.now() - start
+        this.metrics.recordHistogram('db_query_duration_seconds', duration / 1000)
+        this.metrics.incrementCounter('db_queries_total')
 
-        if (options.useTransaction && client) {
-          await client.query('COMMIT')
-        }
+        logger.debug('Database query executed', {
+          duration,
+          rows: result.rowCount,
+          query: text.slice(0, 100), // Log only the first 100 chars of query
+        })
 
-        this.recordMetrics('success', startTime)
         return result
-
       } catch (error) {
-        if (options.useTransaction && client) {
-          await client.query('ROLLBACK')
+        if (!this.shouldRetry(error as Error, retries, options.retry)) {
+          this.metrics.incrementCounter('db_query_errors_total')
+          throw new DatabaseError('Database query failed', { cause: error })
         }
-        throw error
 
-      } finally {
-        if (client) {
-          client.release()
-        }
+        retries++
+        await this.delay(this.retryDelay * retries)
       }
-
-    } catch (error) {
-      this.recordMetrics('error', startTime)
-      logError('Database query failed', error as Error)
-      throw new DatabaseError('Query execution failed', {
-        query: this.sanitizeQuery(sql),
-        error: (error as Error).message
-      })
     }
   }
 
-  public async batch<T>(
-    queries: { sql: string; params?: any[] }[]
-  ): Promise<QueryResult<T>[]> {
-    const startTime = performance.now()
+  public async transaction<T>(
+    callback: (client: PoolClient) => Promise<T>
+  ): Promise<T> {
     const client = await this.pool.connect()
+    const startTime = Date.now()
 
     try {
       await client.query('BEGIN')
-      const results = []
-
-      for (const query of queries) {
-        const result = await client.query(query.sql, query.params)
-        results.push(result)
-      }
-
+      const result = await callback(client)
       await client.query('COMMIT')
-      this.recordMetrics('success', startTime)
-      return results
 
+      const duration = Date.now() - startTime
+      this.metrics.recordHistogram('db_transaction_duration_seconds', duration / 1000)
+      this.metrics.incrementCounter('db_transactions_total')
+
+      return result
     } catch (error) {
       await client.query('ROLLBACK')
-      this.recordMetrics('error', startTime)
-      logError('Database batch operation failed', error as Error)
-      throw new DatabaseError('Batch operation failed')
-
+      this.metrics.incrementCounter('db_transaction_rollbacks_total')
+      throw new DatabaseError('Transaction failed', { cause: error })
     } finally {
       client.release()
     }
@@ -170,125 +145,84 @@ export class DatabaseService {
     try {
       await this.query('SELECT 1')
       return true
-    } catch {
+    } catch (error) {
+      logError('Database health check failed', error as Error)
       return false
     }
   }
 
-  private setupEventHandlers(): void {
-    this.pool.on('connect', () => {
-      this.metrics.increment('database_connections_total')
-    })
+  private shouldRetry(error: Error, retries: number, retry = true): boolean {
+    if (!retry || retries >= this.maxRetries) {
+      return false
+    }
 
-    this.pool.on('error', (error: Error) => {
-      logError('Database pool error', error)
-      this.metrics.increment('database_errors_total')
-    })
+    const retryableErrors = [
+      'connection timeout',
+      'deadlock detected',
+      'connection reset',
+      'too many clients',
+    ]
 
-    this.pool.on('remove', () => {
-      this.metrics.decrement('database_connections_total')
-    })
+    return retryableErrors.some(msg => error.message.includes(msg))
   }
 
-  private async prepareStatement(
+  private async delay(ms: number): Promise<void> {
+    await promisify(setTimeout)(ms)
+  }
+
+  // Prepared Statement Management
+  private preparedStatements = new Map<string, { text: string; name: string }>()
+
+  public async prepare(name: string, text: string): Promise<void> {
+    if (!this.preparedStatements.has(name)) {
+      await this.query(`PREPARE ${name} AS ${text}`)
+      this.preparedStatements.set(name, { text, name })
+    }
+  }
+
+  public async execute<T>(
     name: string,
-    sql: string
-  ): Promise<void> {
-    try {
-      await this.pool.query({
-        name,
-        text: `PREPARE ${name} AS ${sql}`
-      })
-    } catch (error) {
-      logError('Failed to prepare statement', error as Error)
-      throw new DatabaseError('Statement preparation failed')
+    params?: unknown[]
+  ): Promise<QueryResult<T>> {
+    if (!this.preparedStatements.has(name)) {
+      throw new DatabaseError(`Prepared statement ${name} not found`)
     }
+    return this.query<T>(`EXECUTE ${name}`, params)
   }
 
-  private generatePreparedName(sql: string): string {
-    return `stmt_${require('crypto')
-      .createHash('md5')
-      .update(sql)
-      .digest('hex')
-      .substring(0, 10)}`
-  }
-
-  private sanitizeQuery(sql: string): string {
-    return sql
-      .replace(/\s+/g, ' ')
-      .replace(/--.*$/gm, '')
-      .replace(/\/\*[\s\S]*?\*\//g, '')
-      .trim()
-  }
-
-  private recordMetrics(
-    status: 'success' | 'error',
-    startTime: number
-  ): void {
-    const duration = performance.now() - startTime
-    this.metrics.gauge('database_query_duration', duration)
-    this.metrics.increment(`database_queries_${status}_total`)
-    this.metrics.gauge('database_pool_size', this.pool.totalCount)
-    this.metrics.gauge('database_pool_idle', this.pool.idleCount)
-  }
-
-  public async runMigrations(): Promise<void> {
-    const migrationClient = await this.pool.connect()
-    
-    try {
-      await migrationClient.query('BEGIN')
-
-      // Create migrations table if it doesn't exist
-      await migrationClient.query(`
-        CREATE TABLE IF NOT EXISTS migrations (
-          id SERIAL PRIMARY KEY,
-          name VARCHAR(255) NOT NULL,
-          applied_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-        )
-      `)
-
-      // Get list of applied migrations
-      const { rows: appliedMigrations } = await migrationClient.query(
-        'SELECT name FROM migrations'
-      )
-      const applied = new Set(appliedMigrations.map(row => row.name))
-
-      // Get list of migration files
-      const fs = require('fs')
-      const path = require('path')
-      const migrationsDir = path.join(__dirname, '../../../migrations')
-      const files = fs.readdirSync(migrationsDir)
-        .filter(f => f.endsWith('.sql'))
-        .sort()
-
-      // Apply new migrations
-      for (const file of files) {
-        if (!applied.has(file)) {
-          const sql = fs.readFileSync(
-            path.join(migrationsDir, file),
-            'utf8'
-          )
-
-          await migrationClient.query(sql)
-          await migrationClient.query(
-            'INSERT INTO migrations (name) VALUES ($1)',
-            [file]
-          )
-
-          logger.info(`Applied migration: ${file}`)
-        }
+  // Batch Operations
+  public async batch<T>(
+    queries: { text: string; params?: unknown[] }[]
+  ): Promise<QueryResult<T>[]> {
+    return this.transaction(async (client) => {
+      const results: QueryResult<T>[] = []
+      for (const query of queries) {
+        const result = await client.query<T>(query.text, query.params)
+        results.push(result)
       }
+      return results
+    })
+  }
 
-      await migrationClient.query('COMMIT')
-      logger.info('Database migrations completed')
+  // Connection Pool Management
+  public getTotalCount(): number {
+    return this.pool.totalCount
+  }
 
-    } catch (error) {
-      await migrationClient.query('ROLLBACK')
-      logError('Database migration failed', error as Error)
-      throw new DatabaseError('Migration failed')
+  public getIdleCount(): number {
+    return this.pool.idleCount
+  }
 
-    } finally {
-      migrationClient.release()
-    }
+  public getWaitingCount(): number {
+    return this.pool.waitingCount
+  }
+
+  public async resetPool(): Promise<void> {
+    await this.disconnect()
+    this.pool = new Pool(config.database)
+    await this.connect()
   }
 }
+
+// Export singleton instance
+export default DatabaseService.getInstance()
