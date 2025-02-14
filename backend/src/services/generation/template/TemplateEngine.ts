@@ -1,221 +1,256 @@
-import { 
-    Template, 
-    TemplateComponent, 
-    ComponentType, 
-    TemplateContext,
-    ValidationRule,
-    CompositionRule
-} from './types';
-import { SecurityAnalyzer } from '../../security/analyzers/SecurityAnalyzer';
-import { RustCodeGenerator } from '../rust/RustCodeGenerator';
-import { ProgramLayoutParser } from '../../solana/layout/ProgramLayoutParser';
-import { validateTemplateStructure } from './validators/TemplateValidator';
-import { optimizeTemplate } from './optimizers/TemplateOptimizer';
+/**
+ * File: TemplateEngine.ts
+ * Location: /backend/src/services/generation/template/TemplateEngine.ts
+ * Created: 2025-02-14 17:37:05 UTC
+ * Author: solanasynthai
+ */
+
+import { ContractTemplate, SchemaField, InstructionTemplate, SecurityCheck } from '../../../types'
+import { logger, logError } from '../../../utils/logger'
+import { readFileSync } from 'fs'
+import { join } from 'path'
+import Handlebars from 'handlebars'
+import { nanoid } from 'nanoid'
 
 export class TemplateEngine {
-    private static instance: TemplateEngine;
-    private templates: Map<string, Template>;
-    private components: Map<string, TemplateComponent>;
-    private validationRules: Map<string, ValidationRule[]>;
-    private compositionRules: Map<string, CompositionRule[]>;
-    private securityAnalyzer: SecurityAnalyzer;
-    private codeGenerator: RustCodeGenerator;
-    private layoutParser: ProgramLayoutParser;
+  private static instance: TemplateEngine
+  private templates: Map<string, Handlebars.TemplateDelegate>
+  private readonly TEMPLATES_DIR = join(__dirname, '../../../../templates')
+  private readonly DEFAULT_TEMPLATE = 'basic_contract'
 
-    private constructor() {
-        this.templates = new Map();
-        this.components = new Map();
-        this.validationRules = new Map();
-        this.compositionRules = new Map();
-        this.securityAnalyzer = new SecurityAnalyzer();
-        this.codeGenerator = new RustCodeGenerator();
-        this.layoutParser = ProgramLayoutParser.getInstance();
-        this.initializeBaseTemplates();
+  private constructor() {
+    this.templates = new Map()
+    this.registerHelpers()
+    this.loadTemplates()
+  }
+
+  public static getInstance(): TemplateEngine {
+    if (!TemplateEngine.instance) {
+      TemplateEngine.instance = new TemplateEngine()
     }
+    return TemplateEngine.instance
+  }
 
-    public static getInstance(): TemplateEngine {
-        if (!TemplateEngine.instance) {
-            TemplateEngine.instance = new TemplateEngine();
+  public async generateContract(template: ContractTemplate): Promise<string> {
+    try {
+      const startTime = Date.now()
+      const templateName = this.determineTemplate(template)
+      const compiledTemplate = this.templates.get(templateName)
+
+      if (!compiledTemplate) {
+        throw new Error(`Template ${templateName} not found`)
+      }
+
+      // Prepare template context
+      const context = this.prepareContext(template)
+
+      // Generate code
+      const generatedCode = compiledTemplate(context)
+
+      // Validate generated code
+      this.validateGeneratedCode(generatedCode)
+
+      logger.info('Contract generation completed', {
+        templateName,
+        duration: Date.now() - startTime,
+        schemaCount: template.schemas.length,
+        instructionCount: template.instructions.length
+      })
+
+      return generatedCode
+
+    } catch (error) {
+      logError('Contract generation failed', error as Error, {
+        templateName: template.name
+      })
+      throw error
+    }
+  }
+
+  private registerHelpers(): void {
+    // Field type conversion helper
+    Handlebars.registerHelper('solanaType', (fieldType: string) => {
+      const typeMap: Record<string, string> = {
+        'u8': 'u8',
+        'u16': 'u16',
+        'u32': 'u32',
+        'u64': 'u64',
+        'i8': 'i8',
+        'i16': 'i16',
+        'i32': 'i32',
+        'i64': 'i64',
+        'f32': 'f32',
+        'f64': 'f64',
+        'bool': 'bool',
+        'string': 'String',
+        'pubkey': 'Pubkey',
+        'bytes': 'Vec<u8>'
+      }
+      return typeMap[fieldType] || fieldType
+    })
+
+    // Security check helper
+    Handlebars.registerHelper('securityCheck', (check: SecurityCheck) => {
+      const checkTemplates: Record<string, string> = {
+        'ownership': 'require!(ctx.accounts.{{account}}.owner == ctx.program_id, "Invalid account owner");',
+        'signer': 'require!(ctx.accounts.{{account}}.is_signer, "{{account}} must be a signer");',
+        'state': 'require!({{account}}.{{field}} == {{value}}, "Invalid state");',
+        'reentrancy': 'require!(!{{account}}.is_locked, "Reentrancy not allowed");'
+      }
+      return checkTemplates[check.type] || ''
+    })
+
+    // PDA seeds helper
+    Handlebars.registerHelper('pdaSeeds', (seeds: any[]) => {
+      return seeds.map(seed => {
+        if (typeof seed === 'string') {
+          return `b"${seed}"`;
         }
-        return TemplateEngine.instance;
+        return `&${seed.toString()}`
+      }).join(', ')
+    })
+
+    // Unique identifier helper
+    Handlebars.registerHelper('uniqueId', () => nanoid())
+
+    // Field serialization helper
+    Handlebars.registerHelper('serializeField', (field: SchemaField) => {
+      const serializationMap: Record<string, string> = {
+        'u8': 'write_u8',
+        'u16': 'write_u16',
+        'u32': 'write_u32',
+        'u64': 'write_u64',
+        'i8': 'write_i8',
+        'i16': 'write_i16',
+        'i32': 'write_i32',
+        'i64': 'write_i64',
+        'bool': 'write_bool',
+        'pubkey': 'write_pubkey',
+        'string': 'write_string'
+      }
+      return serializationMap[field.type] || 'write_bytes'
+    })
+  }
+
+  private loadTemplates(): void {
+    try {
+      const templateFiles = [
+        'basic_contract.hbs',
+        'token_contract.hbs',
+        'nft_contract.hbs',
+        'dao_contract.hbs',
+        'defi_contract.hbs'
+      ]
+
+      for (const file of templateFiles) {
+        const templatePath = join(this.TEMPLATES_DIR, file)
+        const templateContent = readFileSync(templatePath, 'utf8')
+        const templateName = file.replace('.hbs', '')
+        this.templates.set(templateName, Handlebars.compile(templateContent))
+      }
+
+      logger.info('Templates loaded successfully', {
+        count: this.templates.size,
+        templates: Array.from(this.templates.keys())
+      })
+
+    } catch (error) {
+      logError('Failed to load templates', error as Error)
+      throw error
+    }
+  }
+
+  private determineTemplate(template: ContractTemplate): string {
+    // Analyze template requirements
+    const hasToken = template.schemas.some(s => 
+      s.fields.some(f => f.name.toLowerCase().includes('mint'))
+    )
+    const hasNFT = template.schemas.some(s => 
+      s.fields.some(f => f.name.toLowerCase().includes('metadata'))
+    )
+    const hasGovernance = template.schemas.some(s => 
+      s.fields.some(f => f.name.toLowerCase().includes('proposal'))
+    )
+    const hasDeFi = template.schemas.some(s => 
+      s.fields.some(f => ['swap', 'pool', 'liquidity'].some(term => 
+        f.name.toLowerCase().includes(term)
+      ))
+    )
+
+    // Select appropriate template
+    if (hasToken) return 'token_contract'
+    if (hasNFT) return 'nft_contract'
+    if (hasGovernance) return 'dao_contract'
+    if (hasDeFi) return 'defi_contract'
+    return this.DEFAULT_TEMPLATE
+  }
+
+  private prepareContext(template: ContractTemplate): any {
+    return {
+      name: template.name,
+      version: template.version,
+      description: template.description,
+      schemas: template.schemas.map(schema => ({
+        ...schema,
+        fields: schema.fields.map(field => ({
+          ...field,
+          solanaType: Handlebars.helpers.solanaType(field.type),
+          serializer: Handlebars.helpers.serializeField(field)
+        }))
+      })),
+      instructions: template.instructions.map(instruction => ({
+        ...instruction,
+        uniqueId: nanoid(),
+        hasReentrancyGuard: this.needsReentrancyGuard(instruction)
+      })),
+      metadata: {
+        ...template.metadata,
+        generated: new Date().toISOString(),
+        generator: 'SolSynthai Template Engine v1.0'
+      }
+    }
+  }
+
+  private validateGeneratedCode(code: string): void {
+    // Check for basic syntax
+    if (!code.includes('use solana_program::')) {
+      throw new Error('Missing Solana program imports')
     }
 
-    public registerTemplate(template: Template): void {
-        validateTemplateStructure(template);
-        
-        const optimizedTemplate = optimizeTemplate(template);
-        const securityAnalysis = this.securityAnalyzer.analyzeTemplate(optimizedTemplate);
-        
-        if (securityAnalysis.hasCriticalIssues) {
-            throw new Error(`Template ${template.id} failed security analysis: ${securityAnalysis.issues.join(', ')}`);
-        }
-
-        this.templates.set(template.id, {
-            ...optimizedTemplate,
-            securityProfile: securityAnalysis.profile
-        });
-
-        // Register template components
-        template.components.forEach(component => {
-            this.registerComponent(component);
-        });
-
-        // Register validation rules
-        this.validationRules.set(template.id, template.validationRules || []);
-        
-        // Register composition rules
-        this.compositionRules.set(template.id, template.compositionRules || []);
+    // Check for program ID
+    if (!code.includes('declare_id!')) {
+      throw new Error('Missing program ID declaration')
     }
 
-    public async generateProgram(templateId: string, context: TemplateContext): Promise<string> {
-        const template = this.templates.get(templateId);
-        if (!template) {
-            throw new Error(`Template not found: ${templateId}`);
-        }
-
-        try {
-            // Validate context against template rules
-            this.validateContext(template, context);
-
-            // Compose program structure
-            const programStructure = await this.composeProgramStructure(template, context);
-
-            // Generate Rust code
-            const rustCode = this.codeGenerator.generateProgram(programStructure);
-
-            // Register program layout
-            this.registerProgramLayout(programStructure);
-
-            return rustCode;
-        } catch (error) {
-            throw new Error(`Failed to generate program from template ${templateId}: ${error.message}`);
-        }
+    // Check for instruction processing
+    if (!code.includes('pub fn process_instruction')) {
+      throw new Error('Missing instruction processor')
     }
 
-    private registerComponent(component: TemplateComponent): void {
-        // Validate component
-        this.validateComponent(component);
+    // Check for potential security issues
+    const securityChecks = [
+      { pattern: /unwrap\(\)/, message: 'Unsafe unwrap detected' },
+      { pattern: /panic!\(/, message: 'Panic macro detected' },
+      { pattern: /\.clone\(\)/, message: 'Unnecessary clone detected' }
+    ]
 
-        // Generate and validate component layout
-        const componentLayout = this.layoutParser.createComponentLayout(component);
-        
-        // Register component with its layout
-        this.components.set(component.id, {
-            ...component,
-            layout: componentLayout
-        });
+    for (const check of securityChecks) {
+      if (check.pattern.test(code)) {
+        logger.warn('Security warning in generated code', {
+          warning: check.message
+        })
+      }
     }
+  }
 
-    private validateContext(template: Template, context: TemplateContext): void {
-        const rules = this.validationRules.get(template.id) || [];
-        
-        for (const rule of rules) {
-            if (!rule.validate(context)) {
-                throw new Error(`Context validation failed: ${rule.errorMessage}`);
-            }
-        }
-    }
-
-    private async composeProgramStructure(template: Template, context: TemplateContext): Promise<any> {
-        const compositionRules = this.compositionRules.get(template.id) || [];
-        let programStructure = {
-            components: [],
-            instructions: [],
-            accounts: [],
-            state: {}
-        };
-
-        // Apply base template structure
-        programStructure = {
-            ...programStructure,
-            ...this.applyBaseTemplate(template)
-        };
-
-        // Apply composition rules
-        for (const rule of compositionRules) {
-            programStructure = await rule.apply(programStructure, context);
-        }
-
-        // Validate final structure
-        this.validateProgramStructure(programStructure);
-
-        return programStructure;
-    }
-
-    private applyBaseTemplate(template: Template): any {
-        return {
-            name: template.name,
-            version: template.version,
-            components: template.components.map(component => ({
-                ...component,
-                layout: this.components.get(component.id)?.layout
-            })),
-            instructions: template.instructions,
-            accounts: template.accounts,
-            state: template.state
-        };
-    }
-
-    private validateComponent(component: TemplateComponent): void {
-        switch (component.type) {
-            case ComponentType.INSTRUCTION:
-                this.validateInstructionComponent(component);
-                break;
-            case ComponentType.ACCOUNT:
-                this.validateAccountComponent(component);
-                break;
-            case ComponentType.STATE:
-                this.validateStateComponent(component);
-                break;
-            default:
-                throw new Error(`Unknown component type: ${component.type}`);
-        }
-    }
-
-    private validateInstructionComponent(component: TemplateComponent): void {
-        if (!component.inputs || !component.outputs) {
-            throw new Error(`Invalid instruction component ${component.id}: missing inputs or outputs`);
-        }
-        // Additional instruction-specific validation
-    }
-
-    private validateAccountComponent(component: TemplateComponent): void {
-        if (!component.schema) {
-            throw new Error(`Invalid account component ${component.id}: missing schema`);
-        }
-        // Additional account-specific validation
-    }
-
-    private validateStateComponent(component: TemplateComponent): void {
-        if (!component.schema || !component.initialState) {
-            throw new Error(`Invalid state component ${component.id}: missing schema or initial state`);
-        }
-        // Additional state-specific validation
-    }
-
-    private validateProgramStructure(structure: any): void {
-        // Validate complete program structure
-        if (!structure.components || !structure.instructions || !structure.accounts) {
-            throw new Error('Invalid program structure: missing required sections');
-        }
-
-        // Validate component dependencies
-        this.validateComponentDependencies(structure);
-
-        // Validate instruction flows
-        this.validateInstructionFlows(structure);
-    }
-
-    private validateComponentDependencies(structure: any): void {
-        // Implement component dependency validation
-    }
-
-    private validateInstructionFlows(structure: any): void {
-        // Implement instruction flow validation
-    }
-
-    private registerProgramLayout(structure: any): void {
-        // Register program layout with the layout parser
-        this.layoutParser.registerProgramLayout(structure);
-    }
+  private needsReentrancyGuard(instruction: InstructionTemplate): boolean {
+    const riskPatterns = [
+      /transfer/i,
+      /swap/i,
+      /exchange/i,
+      /cross_program_invoke/i,
+      /invoke/i
+    ]
+    return riskPatterns.some(pattern => pattern.test(instruction.code))
+  }
 }
