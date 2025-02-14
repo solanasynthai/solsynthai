@@ -1,310 +1,200 @@
-import { z } from 'zod'
-import { ConfigurationError } from '../utils/errors'
-import { logger } from '../utils/logger'
+import { cleanEnv, str, num, bool, url, email } from 'envalid'
+import { config as dotenvConfig } from 'dotenv'
 
-const configSchema = z.object({
-  app: z.object({
-    port: z.coerce.number().int().min(1).max(65535),
-    nodeEnv: z.enum(['development', 'test', 'production']).default('development'),
-    apiVersion: z.string().regex(/^v\d+$/),
-    corsOrigin: z.string().url(),
-  }),
+// Load environment variables
+dotenvConfig()
 
-  solana: z.object({
-    network: z.enum(['mainnet-beta', 'testnet', 'devnet', 'localnet']),
-    rpcUrl: z.string().url(),
-    wsUrl: z.string().url(),
-    programId: z.string().regex(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/),
-  }),
+// Validate and transform environment variables
+const env = cleanEnv(process.env, {
+  // Application
+  NODE_ENV: str({ choices: ['development', 'production', 'test'] }),
+  APP_VERSION: str({ default: '1.0.0' }),
+  APP_NAME: str({ default: 'SolSynthai' }),
+  APP_PORT: num({ default: 4000 }),
+  API_PREFIX: str({ default: '/api' }),
+  COOKIE_SECRET: str(),
+  CORS_ORIGIN: str(),
+  REQUEST_LIMIT: str({ default: '10mb' }),
+  RATE_LIMIT_WINDOW: num({ default: 900000 }), // 15 minutes
+  RATE_LIMIT_MAX_REQUESTS: num({ default: 100 }),
 
-  security: z.object({
-    jwtSecret: z.string().min(32),
-    jwtExpiresIn: z.string(),
-    rateLimitWindow: z.number().int().positive(),
-    rateLimitMaxRequests: z.number().int().positive(),
-  }),
+  // Authentication
+  JWT_SECRET: str(),
+  JWT_EXPIRATION: str({ default: '1h' }),
+  REFRESH_TOKEN_SECRET: str(),
+  REFRESH_TOKEN_EXPIRATION: str({ default: '7d' }),
+  PASSWORD_SALT_ROUNDS: num({ default: 12 }),
 
-  ai: z.object({
-    openaiApiKey: z.string().min(1),
-    model: z.string().min(1),
-    maxTokens: z.number().int().positive(),
-  }),
+  // Database
+  DB_HOST: str(),
+  DB_PORT: num({ default: 5432 }),
+  DB_NAME: str(),
+  DB_USER: str(),
+  DB_PASSWORD: str(),
+  DB_SSL: bool({ default: true }),
+  DB_MAX_CONNECTIONS: num({ default: 20 }),
+  DB_IDLE_TIMEOUT: num({ default: 30000 }),
+  DB_CONNECTION_TIMEOUT: num({ default: 2000 }),
 
-  storage: z.object({
-    path: z.string().min(1),
-    maxSize: z.number().int().positive(),
-    backupEnabled: z.boolean(),
-    backupInterval: z.number().int().positive(),
-  }),
+  // Redis Cache
+  REDIS_HOST: str(),
+  REDIS_PORT: num({ default: 6379 }),
+  REDIS_PASSWORD: str(),
+  REDIS_DB: num({ default: 0 }),
+  REDIS_TLS: bool({ default: true }),
+  REDIS_RECONNECT_ATTEMPTS: num({ default: 10 }),
+  REDIS_RECONNECT_DELAY: num({ default: 3000 }),
 
-  monitoring: z.object({
-    enabled: z.boolean(),
-    logLevel: z.enum(['error', 'warn', 'info', 'debug']),
-  }),
+  // WebSocket
+  WS_MAX_CONNECTIONS: num({ default: 1000 }),
+  WS_PING_INTERVAL: num({ default: 30000 }),
+  WS_TIMEOUT: num({ default: 120000 }),
+  WS_MESSAGE_SIZE_LIMIT: num({ default: 5242880 }), // 5MB
 
-  database: z.object({
-    host: z.string().min(1),
-    port: z.coerce.number().int().min(1).max(65535),
-    name: z.string().min(1),
-    user: z.string().min(1),
-    password: z.string().min(1),
-  }),
+  // AI Service
+  AI_API_KEY: str(),
+  AI_API_ENDPOINT: url(),
+  AI_API_VERSION: str({ default: 'v1' }),
+  AI_REQUEST_TIMEOUT: num({ default: 30000 }),
+  AI_MAX_TOKENS: num({ default: 2048 }),
+  AI_TEMPERATURE: num({ default: 0.7 }),
 
-  redis: z.object({
-    host: z.string().min(1),
-    port: z.coerce.number().int().min(1).max(65535),
-    password: z.string().min(1),
-    db: z.number().int().min(0),
-  }),
+  // Solana
+  SOLANA_RPC_URL: url(),
+  SOLANA_NETWORK: str({ choices: ['mainnet-beta', 'testnet', 'devnet'] }),
+  SOLANA_WALLET_SECRET: str(),
+  SOLANA_COMMITMENT: str({ choices: ['processed', 'confirmed', 'finalized'] }),
 
-  aws: z.object({
-    accessKeyId: z.string().min(1),
-    secretAccessKey: z.string().min(1),
-    region: z.string().min(1),
-    bucketName: z.string().min(1),
-  }),
+  // Monitoring
+  METRICS_ENABLED: bool({ default: true }),
+  METRICS_PREFIX: str({ default: 'solsynthai_' }),
+  LOG_LEVEL: str({ choices: ['debug', 'info', 'warn', 'error'] }),
+  SENTRY_DSN: str({ default: '' }),
+  SENTRY_ENVIRONMENT: str({ default: 'production' }),
+  SENTRY_TRACES_SAMPLE_RATE: num({ default: 0.1 }),
 
-  metrics: z.object({
-    prometheusEnabled: z.boolean(),
-    prometheusPort: z.coerce.number().int().min(1).max(65535),
-    grafanaEnabled: z.boolean(),
-    grafanaPort: z.coerce.number().int().min(1).max(65535),
-  }),
+  // Security
+  SECURITY_HEADERS_ENABLED: bool({ default: true }),
+  CSP_ENABLED: bool({ default: true }),
+  RATE_LIMITER_ENABLED: bool({ default: true }),
+  MAX_REQUEST_SIZE: str({ default: '10mb' }),
+  SSL_KEY_PATH: str({ default: '' }),
+  SSL_CERT_PATH: str({ default: '' }),
+  IP_WHITELIST: str({ default: '' }),
 
-  email: z.object({
-    smtpHost: z.string().min(1),
-    smtpPort: z.coerce.number().int().min(1).max(65535),
-    smtpUser: z.string().min(1),
-    smtpPassword: z.string().min(1),
-    emailFrom: z.string().email(),
-  }),
-
-  websocket: z.object({
-    maxConnections: z.number().int().positive(),
-    timeout: z.number().int().positive(),
-    pingInterval: z.number().int().positive(),
-  }),
-
-  contract: z.object({
-    version: z.string().regex(/^\d+\.\d+\.\d+$/),
-    maxProgramSize: z.number().int().positive(),
-    computeBudgetUnits: z.number().int().positive(),
-    priorityFeeLamports: z.number().int().nonnegative(),
-  }),
-
-  cache: z.object({
-    ttl: z.number().int().positive(),
-    maxItems: z.number().int().positive(),
-    checkPeriod: z.number().int().positive(),
-  }),
-
-  api: z.object({
-    rateLimit: z.number().int().positive(),
-    rateWindow: z.number().int().positive(),
-    timeout: z.number().int().positive(),
-  }),
-
-  security_headers: z.object({
-    enabled: z.boolean(),
-    cspEnabled: z.boolean(),
-    helmetEnabled: z.boolean(),
-  }),
-
-  features: z.object({
-    advancedAnalytics: z.boolean(),
-    realtimeMonitoring: z.boolean(),
-    automatedBackups: z.boolean(),
-    aiGeneration: z.boolean(),
-  }),
+  // Admin
+  ADMIN_EMAIL: email(),
+  SUPPORT_EMAIL: email({ default: 'support@solsynthai.com' }),
 })
 
-type Config = z.infer<typeof configSchema>
+export const config = {
+  app: {
+    env: env.NODE_ENV,
+    version: env.APP_VERSION,
+    name: env.APP_NAME,
+    port: env.APP_PORT,
+    apiPrefix: env.API_PREFIX,
+    cookieSecret: env.COOKIE_SECRET,
+    corsOrigin: env.CORS_ORIGIN.split(','),
+    requestLimit: env.REQUEST_LIMIT,
+  },
 
-class Configuration {
-  private static instance: Configuration
-  private config: Config
+  auth: {
+    jwtSecret: env.JWT_SECRET,
+    jwtExpiration: env.JWT_EXPIRATION,
+    refreshTokenSecret: env.REFRESH_TOKEN_SECRET,
+    refreshTokenExpiration: env.REFRESH_TOKEN_EXPIRATION,
+    passwordSaltRounds: env.PASSWORD_SALT_ROUNDS,
+  },
 
-  private constructor() {
-    try {
-      this.config = this.loadConfig()
-      this.validateConfig()
-      logger.info('Configuration loaded successfully')
-    } catch (error) {
-      throw new ConfigurationError('Failed to load configuration', {
-        error: (error as Error).message,
-      })
-    }
-  }
+  database: {
+    host: env.DB_HOST,
+    port: env.DB_PORT,
+    database: env.DB_NAME,
+    user: env.DB_USER,
+    password: env.DB_PASSWORD,
+    ssl: env.DB_SSL,
+    pool: {
+      max: env.DB_MAX_CONNECTIONS,
+      idleTimeoutMillis: env.DB_IDLE_TIMEOUT,
+      connectionTimeoutMillis: env.DB_CONNECTION_TIMEOUT,
+    },
+    migrations: {
+      directory: './src/database/migrations',
+      tableName: 'migrations',
+    },
+  },
 
-  public static getInstance(): Configuration {
-    if (!Configuration.instance) {
-      Configuration.instance = new Configuration()
-    }
-    return Configuration.instance
-  }
+  redis: {
+    host: env.REDIS_HOST,
+    port: env.REDIS_PORT,
+    password: env.REDIS_PASSWORD,
+    db: env.REDIS_DB,
+    tls: env.REDIS_TLS ? {} : undefined,
+    maxRetriesPerRequest: env.REDIS_RECONNECT_ATTEMPTS,
+    retryStrategy: (times: number) => {
+      if (times > env.REDIS_RECONNECT_ATTEMPTS) return null
+      return Math.min(times * env.REDIS_RECONNECT_DELAY, 10000)
+    },
+  },
 
-  public get(): Config {
-    return this.config
-  }
+  websocket: {
+    maxConnections: env.WS_MAX_CONNECTIONS,
+    pingInterval: env.WS_PING_INTERVAL,
+    timeout: env.WS_TIMEOUT,
+    messageSizeLimit: env.WS_MESSAGE_SIZE_LIMIT,
+  },
 
-  private loadConfig(): Config {
-    return configSchema.parse({
-      app: {
-        port: process.env.PORT,
-        nodeEnv: process.env.NODE_ENV,
-        apiVersion: process.env.API_VERSION,
-        corsOrigin: process.env.CORS_ORIGIN,
-      },
-      solana: {
-        network: process.env.SOLANA_NETWORK,
-        rpcUrl: process.env.SOLANA_RPC_URL,
-        wsUrl: process.env.SOLANA_WS_URL,
-        programId: process.env.PROGRAM_ID,
-      },
-      security: {
-        jwtSecret: process.env.JWT_SECRET,
-        jwtExpiresIn: process.env.JWT_EXPIRES_IN,
-        rateLimitWindow: parseInt(process.env.RATE_LIMIT_WINDOW || '900000'),
-        rateLimitMaxRequests: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS || '100'),
-      },
-      ai: {
-        openaiApiKey: process.env.OPENAI_API_KEY,
-        model: process.env.AI_MODEL,
-        maxTokens: parseInt(process.env.AI_MAX_TOKENS || '2000'),
-      },
-      storage: {
-        path: process.env.STORAGE_PATH,
-        maxSize: parseInt(process.env.STORAGE_MAX_SIZE || '1073741824'),
-        backupEnabled: process.env.STORAGE_BACKUP_ENABLED === 'true',
-        backupInterval: parseInt(process.env.STORAGE_BACKUP_INTERVAL || '86400000'),
-      },
-      monitoring: {
-        enabled: process.env.MONITORING_ENABLED === 'true',
-        logLevel: process.env.LOG_LEVEL as 'error' | 'warn' | 'info' | 'debug',
-      },
-      database: {
-        host: process.env.POSTGRES_HOST,
-        port: process.env.POSTGRES_PORT,
-        name: process.env.POSTGRES_DB,
-        user: process.env.POSTGRES_USER,
-        password: process.env.POSTGRES_PASSWORD,
-      },
-      redis: {
-        host: process.env.REDIS_HOST,
-        port: process.env.REDIS_PORT,
-        password: process.env.REDIS_PASSWORD,
-        db: parseInt(process.env.REDIS_DB || '0'),
-      },
-      aws: {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-        region: process.env.AWS_REGION,
-        bucketName: process.env.AWS_BUCKET_NAME,
-      },
-      metrics: {
-        prometheusEnabled: process.env.PROMETHEUS_ENABLED === 'true',
-        prometheusPort: process.env.PROMETHEUS_PORT,
-        grafanaEnabled: process.env.GRAFANA_ENABLED === 'true',
-        grafanaPort: process.env.GRAFANA_PORT,
-      },
-      email: {
-        smtpHost: process.env.SMTP_HOST,
-        smtpPort: process.env.SMTP_PORT,
-        smtpUser: process.env.SMTP_USER,
-        smtpPassword: process.env.SMTP_PASSWORD,
-        emailFrom: process.env.EMAIL_FROM,
-      },
-      websocket: {
-        maxConnections: parseInt(process.env.WS_MAX_CONNECTIONS || '1000'),
-        timeout: parseInt(process.env.WS_TIMEOUT || '30000'),
-        pingInterval: parseInt(process.env.WS_PING_INTERVAL || '10000'),
-      },
-      contract: {
-        version: process.env.CONTRACT_VERSION,
-        maxProgramSize: parseInt(process.env.MAX_PROGRAM_SIZE || '1048576'),
-        computeBudgetUnits: parseInt(process.env.COMPUTE_BUDGET_UNITS || '200000'),
-        priorityFeeLamports: parseInt(process.env.PRIORITY_FEE_LAMPORTS || '10000'),
-      },
-      cache: {
-        ttl: parseInt(process.env.CACHE_TTL || '300'),
-        maxItems: parseInt(process.env.CACHE_MAX_ITEMS || '10000'),
-        checkPeriod: parseInt(process.env.CACHE_CHECK_PERIOD || '600'),
-      },
-      api: {
-        rateLimit: parseInt(process.env.API_RATE_LIMIT || '100'),
-        rateWindow: parseInt(process.env.API_RATE_WINDOW || '900000'),
-        timeout: parseInt(process.env.API_TIMEOUT || '30000'),
-      },
-      security_headers: {
-        enabled: process.env.SECURITY_HEADERS_ENABLED === 'true',
-        cspEnabled: process.env.CSP_ENABLED === 'true',
-        helmetEnabled: process.env.HELMET_ENABLED === 'true',
-      },
-      features: {
-        advancedAnalytics: process.env.FEATURE_ADVANCED_ANALYTICS === 'true',
-        realtimeMonitoring: process.env.FEATURE_REALTIME_MONITORING === 'true',
-        automatedBackups: process.env.FEATURE_AUTOMATED_BACKUPS === 'true',
-        aiGeneration: process.env.FEATURE_AI_GENERATION === 'true',
-      },
-    })
-  }
+  ai: {
+    apiKey: env.AI_API_KEY,
+    apiEndpoint: env.AI_API_ENDPOINT,
+    apiVersion: env.AI_API_VERSION,
+    requestTimeout: env.AI_REQUEST_TIMEOUT,
+    maxTokens: env.AI_MAX_TOKENS,
+    temperature: env.AI_TEMPERATURE,
+  },
 
-  private validateConfig(): void {
-    // Additional validation beyond schema checks
-    this.validateSolanaEndpoints()
-    this.validateStoragePath()
-    this.validateSecrets()
-    this.validatePorts()
-  }
+  solana: {
+    rpcUrl: env.SOLANA_RPC_URL,
+    network: env.SOLANA_NETWORK,
+    walletSecret: env.SOLANA_WALLET_SECRET,
+    commitment: env.SOLANA_COMMITMENT,
+  },
 
-  private validateSolanaEndpoints(): void {
-    const { rpcUrl, wsUrl } = this.config.solana
-    if (!rpcUrl.includes(this.config.solana.network)) {
-      throw new ConfigurationError('RPC URL does not match network')
-    }
-    if (!wsUrl.includes(this.config.solana.network)) {
-      throw new ConfigurationError('WebSocket URL does not match network')
-    }
-  }
+  monitoring: {
+    metricsEnabled: env.METRICS_ENABLED,
+    metricsPrefix: env.METRICS_PREFIX,
+    logLevel: env.LOG_LEVEL,
+    sentry: {
+      dsn: env.SENTRY_DSN,
+      environment: env.SENTRY_ENVIRONMENT,
+      tracesSampleRate: env.SENTRY_TRACES_SAMPLE_RATE,
+    },
+  },
 
-  private validateStoragePath(): void {
-    const fs = require('fs')
-    if (!fs.existsSync(this.config.storage.path)) {
-      throw new ConfigurationError('Storage path does not exist')
-    }
-  }
+  security: {
+    headersEnabled: env.SECURITY_HEADERS_ENABLED,
+    cspEnabled: env.CSP_ENABLED,
+    rateLimiter: {
+      enabled: env.RATE_LIMITER_ENABLED,
+      windowMs: env.RATE_LIMIT_WINDOW,
+      max: env.RATE_LIMIT_MAX_REQUESTS,
+    },
+    ssl: {
+      keyPath: env.SSL_KEY_PATH,
+      certPath: env.SSL_CERT_PATH,
+    },
+    ipWhitelist: env.IP_WHITELIST ? env.IP_WHITELIST.split(',') : [],
+  },
 
-  private validateSecrets(): void {
-    const secrets = [
-      this.config.security.jwtSecret,
-      this.config.database.password,
-      this.config.redis.password,
-      this.config.aws.secretAccessKey,
-      this.config.email.smtpPassword,
-    ]
+  admin: {
+    email: env.ADMIN_EMAIL,
+    supportEmail: env.SUPPORT_EMAIL,
+  },
 
-    for (const secret of secrets) {
-      if (secret.length < 16) {
-        throw new ConfigurationError('Secret too short')
-      }
-    }
-  }
+  isDevelopment: env.NODE_ENV === 'development',
+  isProduction: env.NODE_ENV === 'production',
+  isTest: env.NODE_ENV === 'test',
+} as const
 
-  private validatePorts(): void {
-    const ports = new Set([
-      this.config.app.port,
-      this.config.database.port,
-      this.config.redis.port,
-      this.config.metrics.prometheusPort,
-      this.config.metrics.grafanaPort,
-      this.config.email.smtpPort,
-    ])
-
-    if (ports.size !== 6) {
-      throw new ConfigurationError('Duplicate port numbers detected')
-    }
-  }
-}
-
-export const config = Configuration.getInstance().get()
 export default config
