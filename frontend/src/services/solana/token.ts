@@ -1,10 +1,3 @@
-/**
- * File: token.ts
- * Location: /frontend/src/services/solana/token.ts
- * Created: 2025-02-14 17:08:02 UTC
- * Author: solanasynthai
- */
-
 import {
   Connection,
   Keypair,
