@@ -33,90 +33,20 @@ SolSynthai automates the creation, optimization, and deployment of Solana smart 
 - Account state management
 - Real-time updates via WebSocket
 
-## Installation
+## Local Installation
 
-### Prerequisites
-```bash
-# Install Node.js
-https://nodejs.org/
-
-# Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# Install Solana CLI tools
-sh -c "$(curl -sSfL https://release.solana.com/v1.17.0/install)"
+```
+SECTION WILL BE UPDATED ONCE DEPLOYABLE
 ```
 
-### Setup Repository
-```bash
-# Clone the repository
-git clone https://github.com/solanasynthai/solsynthai.git
-cd solsynthai
-
-# Install frontend dependencies
-cd frontend
-npm install
-
-# Install backend dependencies
-cd ../backend
-npm install
-```
-
-### Environment Configuration
-
-1. Frontend Configuration:
-```bash
-cd frontend
-cp .env.example .env
-```
-
-Edit `frontend/.env`:
-```env
-REACT_APP_BACKEND_URL=http://localhost:4000
-REACT_APP_SOLANA_NETWORK=devnet
-```
-
-2. Backend Configuration:
-```bash
-cd backend
-cp .env.example .env
-```
-
-Edit `backend/.env`:
-```env
-PORT=4000
-NODE_ENV=development
-OPENAI_API_KEY=your_key_here
-SOLANA_RPC_URL=your_rpc_url
-```
-
-## Development
+## Web App 
 
 ### Starting the Application
 
-1. Start Backend:
-```bash
-cd backend
-npm run dev
+```
+SECTION WILL BE UPDATED ONCE WEB APP IS RELEASED
 ```
 
-2. Start Frontend:
-```bash
-cd frontend
-npm run dev
-```
-
-### Using Docker
-```bash
-# Start all services
-docker-compose up -d
-
-# View logs
-docker-compose logs -f
-
-# Stop services
-docker-compose down
-```
 
 ## Contract Templates
 
@@ -148,11 +78,9 @@ Each template can be customized through:
 
 ## Contributing
 
-1. Fork repository: https://github.com/solanasynthai/solsynthai/fork
-2. Create feature branch: `git checkout -b feature/new-feature`
-3. Commit changes: `git commit -am 'Add new feature'`
-4. Push branch: `git push origin feature/new-feature`
-5. Submit Pull Request
+```
+SECTION WILL BE UPDATED ONCE DEPLOYABLE
+```
 
 ### Development Guidelines
 - Follow Rust and TypeScript best practices
@@ -162,18 +90,8 @@ Each template can be customized through:
 
 ## Testing
 
-```bash
-# Frontend Tests
-cd frontend
-npm test
-
-# Backend Tests
-cd backend
-npm test
-
-# Contract Tests
-cd contracts
-cargo test
+```
+SECTION WILL BE UPDATED ONCE DEPLOYABLE
 ```
 
 
