@@ -45,7 +45,7 @@ SolSynthai automates the creation, optimization, and deployment of Solana smart 
 SECTION WILL BE UPDATED ONCE WEB APP IS RELEASED
 ```
 
-## 🚀 Quick Start (Local)
+## Quick Start (Local)
 
 ### Prerequisites
 - Node.js ≥ 18.0.0
