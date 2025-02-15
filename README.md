@@ -39,13 +39,13 @@ SolSynthai automates the creation, optimization, and deployment of Solana smart 
 - 🔒 Secure key management
 - 🚫 Rate limiting protection
 
-## 🚀 Quick Start
-
-### Web App 
+## Web App 
 
 ```
 SECTION WILL BE UPDATED ONCE WEB APP IS RELEASED
 ```
+
+## 🚀 Quick Start (Local)
 
 ### Prerequisites
 - Node.js ≥ 18.0.0
@@ -54,7 +54,7 @@ SECTION WILL BE UPDATED ONCE WEB APP IS RELEASED
 - PostgreSQL ≥ 15
 - Redis ≥ 7
 
-### Local Installation
+### Installation
 
 1. Clone the repository:
 ```bash
