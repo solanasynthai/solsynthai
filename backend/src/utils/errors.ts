@@ -1,294 +1,280 @@
-import { logger } from './logger'
+import { logger } from './logger';
 
+// Base custom error class
 export class BaseError extends Error {
-  public readonly code: string
-  public readonly status: number
-  public readonly details: Record<string, any>
-  public readonly timestamp: string
-  public readonly isOperational: boolean
+  public readonly name: string;
+  public readonly httpCode: number;
+  public readonly isOperational: boolean;
+  public readonly context?: Record<string, any>;
 
   constructor(
-    message: string,
-    code: string,
-    status: number = 500,
-    details: Record<string, any> = {},
-    isOperational: boolean = true
+    name: string,
+    httpCode: number,
+    description: string,
+    isOperational: boolean,
+    context?: Record<string, any>
   ) {
-    super(message)
-    this.name = this.constructor.name
-    this.code = code
-    this.status = status
-    this.details = details
-    this.timestamp = new Date().toISOString()
-    this.isOperational = isOperational
+    super(description);
+    Object.setPrototypeOf(this, new.target.prototype);
 
-    Error.captureStackTrace(this, this.constructor)
-    logger.error(this.toString())
-  }
+    this.name = name;
+    this.httpCode = httpCode;
+    this.isOperational = isOperational;
+    this.context = context;
 
-  public toString(): string {
-    return JSON.stringify({
-      name: this.name,
-      message: this.message,
-      code: this.code,
-      status: this.status,
-      details: this.details,
-      timestamp: this.timestamp,
-      stack: this.stack
-    }, null, 2)
-  }
-
-  public toJSON(): Record<string, any> {
-    return {
-      error: {
-        name: this.name,
-        message: this.message,
-        code: this.code,
-        status: this.status,
-        details: this.details,
-        timestamp: this.timestamp
-      }
-    }
+    Error.captureStackTrace(this);
   }
 }
 
-export class AIServiceError extends BaseError {
+// API Error class for handling HTTP-related errors
+export class ApiError extends BaseError {
   constructor(
-    message: string,
-    details: Record<string, any> = {}
+    code: ErrorCode,
+    description: string,
+    context?: Record<string, any>
   ) {
+    const errorSpec = ErrorSpecs[code];
     super(
-      message,
-      'AI_SERVICE_ERROR',
-      500,
-      details,
-      true
-    )
+      errorSpec.name,
+      errorSpec.httpCode,
+      description,
+      errorSpec.isOperational,
+      context
+    );
   }
 }
 
-export class ValidationError extends BaseError {
-  constructor(
-    message: string,
-    details: Record<string, any> = {}
-  ) {
-    super(
-      message,
-      'VALIDATION_ERROR',
-      400,
-      details,
-      true
-    )
-  }
-}
-
-export class AuthenticationError extends BaseError {
-  constructor(
-    message: string,
-    details: Record<string, any> = {}
-  ) {
-    super(
-      message,
-      'AUTHENTICATION_ERROR',
-      401,
-      details,
-      true
-    )
-  }
-}
-
-export class AuthorizationError extends BaseError {
-  constructor(
-    message: string,
-    details: Record<string, any> = {}
-  ) {
-    super(
-      message,
-      'AUTHORIZATION_ERROR',
-      403,
-      details,
-      true
-    )
-  }
-}
-
-export class NotFoundError extends BaseError {
-  constructor(
-    message: string,
-    details: Record<string, any> = {}
-  ) {
-    super(
-      message,
-      'NOT_FOUND_ERROR',
-      404,
-      details,
-      true
-    )
-  }
-}
-
-export class RateLimitError extends BaseError {
-  constructor(
-    message: string,
-    details: Record<string, any> = {}
-  ) {
-    super(
-      message,
-      'RATE_LIMIT_ERROR',
-      429,
-      details,
-      true
-    )
-  }
-}
-
-export class BlockchainError extends BaseError {
-  constructor(
-    message: string,
-    details: Record<string, any> = {}
-  ) {
-    super(
-      message,
-      'BLOCKCHAIN_ERROR',
-      503,
-      details,
-      true
-    )
-  }
-}
-
-export class ContractError extends BaseError {
-  constructor(
-    message: string,
-    details: Record<string, any> = {}
-  ) {
-    super(
-      message,
-      'CONTRACT_ERROR',
-      400,
-      details,
-      true
-    )
-  }
-}
-
-export class TransactionError extends BaseError {
-  constructor(
-    message: string,
-    details: Record<string, any> = {}
-  ) {
-    super(
-      message,
-      'TRANSACTION_ERROR',
-      400,
-      details,
-      true
-    )
-  }
-}
-
+// Database-specific error class
 export class DatabaseError extends BaseError {
   constructor(
     message: string,
-    details: Record<string, any> = {}
+    originalError: any
   ) {
     super(
-      message,
-      'DATABASE_ERROR',
-      503,
-      details,
-      false
-    )
-  }
-}
-
-export class ConfigurationError extends BaseError {
-  constructor(
-    message: string,
-    details: Record<string, any> = {}
-  ) {
-    super(
-      message,
-      'CONFIGURATION_ERROR',
+      'DatabaseError',
       500,
-      details,
-      false
-    )
-  }
-}
-
-export class ServiceUnavailableError extends BaseError {
-  constructor(
-    message: string,
-    details: Record<string, any> = {}
-  ) {
-    super(
       message,
-      'SERVICE_UNAVAILABLE',
-      503,
-      details,
-      true
-    )
-  }
-}
-
-export function isOperationalError(error: Error): boolean {
-  if (error instanceof BaseError) {
-    return error.isOperational
-  }
-  return false
-}
-
-export function handleError(error: Error): void {
-  if (!isOperationalError(error)) {
-    logger.error('Non-operational error occurred', {
-      error: error.message,
-      stack: error.stack,
-      name: error.name
-    })
-    process.exit(1)
-  }
-}
-
-export function convertToAPIError(error: unknown): BaseError {
-  if (error instanceof BaseError) {
-    return error
-  }
-
-  if (error instanceof Error) {
-    return new BaseError(
-      error.message,
-      'INTERNAL_SERVER_ERROR',
-      500,
+      true,
       {
-        originalError: error.name,
-        stack: error.stack
-      },
-      false
-    )
+        originalError: originalError?.message,
+        code: originalError?.code,
+        detail: originalError?.detail
+      }
+    );
   }
-
-  return new BaseError(
-    'An unexpected error occurred',
-    'UNKNOWN_ERROR',
-    500,
-    {
-      originalError: error
-    },
-    false
-  )
 }
 
-export const errorHandler = (
+// Validation error class
+export class ValidationError extends BaseError {
+  public readonly errors: ValidationErrorDetail[];
+
+  constructor(message: string, errors: ValidationErrorDetail[]) {
+    super(
+      'ValidationError',
+      400,
+      message,
+      true,
+      { errors }
+    );
+    this.errors = errors;
+  }
+}
+
+// Contract-specific error class
+export class ContractError extends BaseError {
+  constructor(
+    code: ContractErrorCode,
+    description: string,
+    context?: Record<string, any>
+  ) {
+    const errorSpec = ContractErrorSpecs[code];
+    super(
+      errorSpec.name,
+      errorSpec.httpCode,
+      description,
+      errorSpec.isOperational,
+      context
+    );
+  }
+}
+
+// Types and interfaces
+export type ErrorCode = keyof typeof ErrorSpecs;
+export type ContractErrorCode = keyof typeof ContractErrorSpecs;
+
+export interface ValidationErrorDetail {
+  field: string;
+  message: string;
+  code: string;
+}
+
+export interface ErrorSpec {
+  name: string;
+  httpCode: number;
+  isOperational: boolean;
+}
+
+// Error specifications
+export const ErrorSpecs: Record<string, ErrorSpec> = {
+  INVALID_INPUT: {
+    name: 'InvalidInputError',
+    httpCode: 400,
+    isOperational: true
+  },
+  UNAUTHORIZED: {
+    name: 'UnauthorizedError',
+    httpCode: 401,
+    isOperational: true
+  },
+  FORBIDDEN: {
+    name: 'ForbiddenError',
+    httpCode: 403,
+    isOperational: true
+  },
+  NOT_FOUND: {
+    name: 'NotFoundError',
+    httpCode: 404,
+    isOperational: true
+  },
+  RATE_LIMIT_EXCEEDED: {
+    name: 'RateLimitExceededError',
+    httpCode: 429,
+    isOperational: true
+  },
+  INTERNAL_SERVER_ERROR: {
+    name: 'InternalServerError',
+    httpCode: 500,
+    isOperational: false
+  },
+  SERVICE_UNAVAILABLE: {
+    name: 'ServiceUnavailableError',
+    httpCode: 503,
+    isOperational: true
+  }
+};
+
+// Contract-specific error specifications
+export const ContractErrorSpecs: Record<string, ErrorSpec> = {
+  COMPILATION_FAILED: {
+    name: 'CompilationError',
+    httpCode: 400,
+    isOperational: true
+  },
+  DEPLOYMENT_FAILED: {
+    name: 'DeploymentError',
+    httpCode: 400,
+    isOperational: true
+  },
+  VERIFICATION_FAILED: {
+    name: 'VerificationError',
+    httpCode: 400,
+    isOperational: true
+  },
+  OPTIMIZATION_FAILED: {
+    name: 'OptimizationError',
+    httpCode: 400,
+    isOperational: true
+  },
+  INVALID_BYTECODE: {
+    name: 'InvalidBytecodeError',
+    httpCode: 400,
+    isOperational: true
+  },
+  SIZE_LIMIT_EXCEEDED: {
+    name: 'SizeLimitExceededError',
+    httpCode: 400,
+    isOperational: true
+  }
+};
+
+// Error handler function
+export const errorHandler = (error: Error): void => {
+  if (error instanceof BaseError) {
+    if (error.isOperational) {
+      logger.warn('Operational error:', {
+        name: error.name,
+        message: error.message,
+        httpCode: error.httpCode,
+        context: error.context
+      });
+    } else {
+      logger.error('Programming error:', {
+        name: error.name,
+        message: error.message,
+        stack: error.stack,
+        context: error.context
+      });
+    }
+  } else {
+    logger.error('Unhandled error:', {
+      name: error.name,
+      message: error.message,
+      stack: error.stack
+    });
+  }
+};
+
+// Helper functions for common error cases
+export const createNotFoundError = (
+  resource: string,
+  id: string
+): ApiError => {
+  return new ApiError(
+    'NOT_FOUND',
+    `${resource} with ID ${id} not found`,
+    { resource, id }
+  );
+};
+
+export const createValidationError = (
+  errors: ValidationErrorDetail[]
+): ValidationError => {
+  return new ValidationError(
+    'Validation failed',
+    errors
+  );
+};
+
+export const createAuthenticationError = (
+  message: string = 'Authentication required'
+): ApiError => {
+  return new ApiError(
+    'UNAUTHORIZED',
+    message
+  );
+};
+
+export const createForbiddenError = (
+  message: string = 'Access denied'
+): ApiError => {
+  return new ApiError(
+    'FORBIDDEN',
+    message
+  );
+};
+
+// Error middleware for Express
+export const errorMiddleware = (
   error: Error,
-  includeStack: boolean = process.env.NODE_ENV !== 'production'
-): Record<string, any> => {
-  const apiError = convertToAPIError(error)
-  const response = apiError.toJSON()
+  req: any,
+  res: any,
+  next: any
+): void => {
+  errorHandler(error);
 
-  if (includeStack && apiError.stack) {
-    response.error.stack = apiError.stack
+  if (error instanceof BaseError) {
+    res.status(error.httpCode).json({
+      status: 'error',
+      code: error.name,
+      message: error.message,
+      ...(error instanceof ValidationError && { errors: error.errors }),
+      ...(error.context && { context: error.context })
+    });
+  } else {
+    res.status(500).json({
+      status: 'error',
+      code: 'INTERNAL_SERVER_ERROR',
+      message: 'An unexpected error occurred'
+    });
   }
-
-  return response
-}
+};
