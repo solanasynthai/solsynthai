@@ -1,0 +1,152 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  scrape_timeout: 10s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - alertmanager:9093
+
+rule_files:
+  - "/etc/prometheus/rules/*.yml"
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: backend
+    metrics_path: /metrics
+    scrape_interval: 10s
+    static_configs:
+      - targets: ['backend:3000']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        regex: '([^:]+)(?::\d+)?'
+        replacement: '${1}'
+
+  - job_name: redis
+    static_configs:
+      - targets: ['redis:6379']
+    metrics_path: /metrics
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        regex: '([^:]+)(?::\d+)?'
+        replacement: '${1}'
+
+  - job_name: postgres
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+    metrics_path: /metrics
+
+  - job_name: node
+    static_configs:
+      - targets: ['node-exporter:9100']
+
+  - job_name: solana_nodes
+    metrics_path: /metrics
+    scrape_interval: 30s
+    static_configs:
+      - targets:
+        - 'solana-mainnet:8899'
+        - 'solana-devnet:8899'
+        - 'solana-testnet:8899'
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: network
+        regex: 'solana-(.*):.*'
+        replacement: '${1}'
+
+  - job_name: contract_metrics
+    metrics_path: /api/v1/metrics/contracts
+    scrape_interval: 1m
+    static_configs:
+      - targets: ['backend:3000']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: service
+        replacement: 'contract-metrics'
+
+  - job_name: deployment_metrics
+    metrics_path: /api/v1/metrics/deployments
+    scrape_interval: 1m
+    static_configs:
+      - targets: ['backend:3000']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: service
+        replacement: 'deployment-metrics'
+
+alerting_rules:
+  groups:
+    - name: contract_alerts
+      rules:
+        - alert: HighContractFailureRate
+          expr: rate(contract_deployment_failures_total[5m]) > 0.1
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: High contract deployment failure rate
+            description: "Contract deployment failure rate is above 10% for 5 minutes"
+
+        - alert: HighAPILatency
+          expr: http_request_duration_seconds{quantile="0.9"} > 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: High API latency
+            description: "90th percentile of API requests is taking more than 1s"
+
+        - alert: HighRedisMemoryUsage
+          expr: redis_memory_used_bytes / redis_memory_max_bytes * 100 > 80
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: High Redis memory usage
+            description: "Redis memory usage is above 80%"
+
+        - alert: DatabaseConnections
+          expr: pg_stat_activity_count > 80
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: High database connections
+            description: "Database connection count is above 80"
+
+        - alert: SolanaNodeSync
+          expr: solana_slot_lag > 128
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: Solana node sync issues
+            description: "Solana node is lagging by more than 128 slots"
+
+recording_rules:
+  groups:
+    - name: contract_metrics
+      interval: 1m
+      rules:
+        - record: contract:deployment_success_rate:5m
+          expr: sum(rate(contract_deployments_total{status="success"}[5m])) / sum(rate(contract_deployments_total[5m]))
+
+        - record: api:request_latency:99percentile
+          expr: histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))
+
+        - record: system:memory_usage:percent
+          expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100
+
+storage:
+  tsdb:
+    retention.time: 30d
+    retention.size: 50GB
+    wal:
+      retention.time: 12h
