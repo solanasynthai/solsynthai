@@ -1,261 +1,315 @@
-import { Request, Response } from 'express';
-import { PublicKey } from '@solana/web3.js';
-import { ContractDeploymentService } from '../services/deployment/ContractDeploymentService';
-import { AccountStateManager } from '../services/solana/state/AccountStateManager';
-import { ContractError, NotFoundError } from '../utils/errors';
+import { Request, Response, NextFunction } from 'express';
+import { Connection, PublicKey, Transaction, SystemProgram } from '@solana/web3.js';
+import { Pool } from 'pg';
+import { Redis } from 'ioredis';
+import { ErrorWithCode } from '../utils/errors';
+import { MetricsService } from '../services/monitoring/MetricsService';
 import { logger } from '../utils/logger';
+import { config } from '../config';
+import { DeploymentStatus, Network } from '../types';
+import { BpfLoader } from '../services/solana/BpfLoader';
+import { validateProgramSize } from '../utils/validation';
 
 export class DeploymentController {
-    private deploymentService: ContractDeploymentService;
-    private stateManager: AccountStateManager;
+  private db: Pool;
+  private redis: Redis;
+  private connections: Map<Network, Connection>;
+  private bpfLoader: BpfLoader;
 
-    constructor() {
-        this.deploymentService = new ContractDeploymentService();
-        this.stateManager = AccountStateManager.getInstance();
+  constructor() {
+    this.db = new Pool(config.database);
+    this.redis = new Redis(config.redis.url);
+    this.connections = new Map(
+      Object.entries(config.solana.networks).map(([network, url]) => [
+        network as Network,
+        new Connection(url, { commitment: 'confirmed' })
+      ])
+    );
+    this.bpfLoader = new BpfLoader();
+  }
+
+  public createDeployment = async (
+    req: Request,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> => {
+    const client = await this.db.connect();
+    try {
+      await client.query('BEGIN');
+
+      const {
+        contractId,
+        network,
+        programId,
+        metadata = {}
+      } = req.body;
+
+      // Validate network
+      if (!Object.values(Network).includes(network)) {
+        throw new ErrorWithCode('Invalid network', 'INVALID_NETWORK');
+      }
+
+      // Get contract
+      const { rows: [contract] } = await client.query(`
+        SELECT * FROM contracts WHERE id = $1
+      `, [contractId]);
+
+      if (!contract) {
+        throw new ErrorWithCode('Contract not found', 'CONTRACT_NOT_FOUND');
+      }
+
+      // Check contract ownership
+      if (contract.author_id !== req.user!.id) {
+        throw new ErrorWithCode('Access denied', 'ACCESS_DENIED');
+      }
+
+      // Validate program ID
+      try {
+        new PublicKey(programId);
+      } catch {
+        throw new ErrorWithCode('Invalid program ID', 'INVALID_PROGRAM_ID');
+      }
+
+      // Validate contract status
+      if (contract.status !== 'compiled') {
+        throw new ErrorWithCode(
+          'Contract must be compiled before deployment',
+          'INVALID_CONTRACT_STATUS'
+        );
+      }
+
+      // Validate program size
+      const maxSize = config.solana.maxProgramSize;
+      if (!validateProgramSize(contract.bytecode, maxSize)) {
+        throw new ErrorWithCode(
+          `Program size exceeds maximum of ${maxSize} bytes`,
+          'PROGRAM_SIZE_EXCEEDED'
+        );
+      }
+
+      // Create deployment record
+      const { rows: [deployment] } = await client.query(`
+        INSERT INTO deployments (
+          contract_id,
+          network,
+          program_id,
+          deployer_id,
+          status,
+          metadata
+        )
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING *
+      `, [
+        contractId,
+        network,
+        programId,
+        req.user!.id,
+        DeploymentStatus.PENDING,
+        metadata
+      ]);
+
+      await client.query('COMMIT');
+
+      // Start async deployment
+      this.handleDeployment(deployment).catch(error => {
+        logger.error('Deployment failed:', { error, deploymentId: deployment.id });
+      });
+
+      res.status(201).json(deployment);
+
+      MetricsService.increment('deployment.create', { network });
+    } catch (error) {
+      await client.query('ROLLBACK');
+      next(error);
+    } finally {
+      client.release();
     }
+  };
 
-    public deployContract = async (req: Request, res: Response): Promise<void> => {
-        const { contractId, network, options } = req.body;
+  public getDeployment = async (
+    req: Request,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> => {
+    try {
+      const { id } = req.params;
 
-        try {
-            const contract = await this.stateManager.loadAccount(
-                new PublicKey(contractId)
-            );
+      const { rows: [deployment] } = await this.db.query(`
+        SELECT d.*, c.name as contract_name, c.author_id
+        FROM deployments d
+        JOIN contracts c ON d.contract_id = c.id
+        WHERE d.id = $1
+      `, [id]);
 
-            if (!contract) {
-                throw new NotFoundError('Contract');
-            }
+      if (!deployment) {
+        throw new ErrorWithCode('Deployment not found', 'DEPLOYMENT_NOT_FOUND');
+      }
 
-            const deployment = await this.deploymentService.deploy(
-                contract,
-                network,
-                options
-            );
+      // Check permissions
+      if (deployment.author_id !== req.user!.id) {
+        throw new ErrorWithCode('Access denied', 'ACCESS_DENIED');
+      }
 
-            logger.info('Contract deployed', {
-                contractId,
-                network,
-                programId: deployment.programId,
-                signature: deployment.signature
-            });
+      res.json(deployment);
 
-            res.json({
-                success: true,
-                data: {
-                    programId: deployment.programId,
-                    signature: deployment.signature,
-                    network,
-                    timestamp: deployment.timestamp,
-                    status: deployment.status,
-                    logs: deployment.logs
-                }
-            });
-        } catch (error) {
-            logger.error('Contract deployment failed', {
-                contractId,
-                network,
-                error: error.message,
-                stack: error.stack
-            });
-            throw error;
-        }
-    };
+      MetricsService.increment('deployment.get');
+    } catch (error) {
+      next(error);
+    }
+  };
 
-    public getDeploymentStatus = async (req: Request, res: Response): Promise<void> => {
-        const { deploymentId } = req.params;
+  public listDeployments = async (
+    req: Request,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> => {
+    try {
+      const {
+        page = 1,
+        limit = 10,
+        contractId,
+        network,
+        status
+      } = req.query;
 
-        try {
-            const status = await this.deploymentService.getDeploymentStatus(deploymentId);
+      const offset = (Number(page) - 1) * Number(limit);
+      
+      let query = `
+        SELECT d.*, c.name as contract_name,
+        COUNT(*) OVER() as total_count
+        FROM deployments d
+        JOIN contracts c ON d.contract_id = c.id
+        WHERE c.author_id = $1
+      `;
+      const params: any[] = [req.user!.id];
+      let paramCount = 2;
 
-            if (!status) {
-                throw new NotFoundError('Deployment');
-            }
+      if (contractId) {
+        query += ` AND d.contract_id = $${paramCount}`;
+        params.push(contractId);
+        paramCount++;
+      }
 
-            res.json({
-                success: true,
-                data: status
-            });
-        } catch (error) {
-            logger.error('Deployment status check failed', {
-                deploymentId,
-                error: error.message
-            });
-            throw error;
-        }
-    };
+      if (network) {
+        query += ` AND d.network = $${paramCount}`;
+        params.push(network);
+        paramCount++;
+      }
 
-    public simulateDeployment = async (req: Request, res: Response): Promise<void> => {
-        const { contractId, network, options } = req.body;
+      if (status) {
+        query += ` AND d.status = $${paramCount}`;
+        params.push(status);
+        paramCount++;
+      }
 
-        try {
-            const contract = await this.stateManager.loadAccount(
-                new PublicKey(contractId)
-            );
+      query += ` ORDER BY d.created_at DESC LIMIT $${paramCount} OFFSET $${paramCount + 1}`;
+      params.push(limit, offset);
 
-            if (!contract) {
-                throw new NotFoundError('Contract');
-            }
+      const { rows } = await this.db.query(query, params);
+      const totalCount = rows[0]?.total_count || 0;
 
-            const simulation = await this.deploymentService.simulate(
-                contract,
-                network,
-                options
-            );
+      res.json({
+        deployments: rows.map(row => ({
+          ...row,
+          total_count: undefined
+        })),
+        total: totalCount,
+        page: Number(page),
+        limit: Number(limit),
+        pages: Math.ceil(totalCount / Number(limit))
+      });
 
-            logger.info('Deployment simulation completed', {
-                contractId,
-                network,
-                computeUnits: simulation.computeUnits,
-                requiredSpace: simulation.requiredSpace
-            });
+      MetricsService.increment('deployment.list', { network, status });
+    } catch (error) {
+      next(error);
+    }
+  };
 
-            res.json({
-                success: true,
-                data: {
-                    computeUnits: simulation.computeUnits,
-                    requiredSpace: simulation.requiredSpace,
-                    estimatedCost: simulation.estimatedCost,
-                    warnings: simulation.warnings,
-                    logs: simulation.logs
-                }
-            });
-        } catch (error) {
-            logger.error('Deployment simulation failed', {
-                contractId,
-                network,
-                error: error.message
-            });
-            throw error;
-        }
-    };
+  private async handleDeployment(deployment: any): Promise<void> {
+    const client = await this.db.connect();
+    try {
+      await client.query('BEGIN');
 
-    public upgradeContract = async (req: Request, res: Response): Promise<void> => {
-        const { contractId, programId, network, options } = req.body;
+      // Update status to processing
+      await client.query(`
+        UPDATE deployments
+        SET status = $1, updated_at = CURRENT_TIMESTAMP
+        WHERE id = $2
+      `, [DeploymentStatus.PROCESSING, deployment.id]);
 
-        try {
-            const contract = await this.stateManager.loadAccount(
-                new PublicKey(contractId)
-            );
+      // Get contract bytecode
+      const { rows: [contract] } = await client.query(`
+        SELECT bytecode FROM contracts WHERE id = $1
+      `, [deployment.contract_id]);
 
-            if (!contract) {
-                throw new NotFoundError('Contract');
-            }
+      // Get connection for network
+      const connection = this.connections.get(deployment.network as Network);
+      if (!connection) {
+        throw new Error(`No connection for network: ${deployment.network}`);
+      }
 
-            const upgrade = await this.deploymentService.upgrade(
-                contract,
-                new PublicKey(programId),
-                network,
-                options
-            );
+      // Deploy program
+      const programId = new PublicKey(deployment.program_id);
+      const result = await this.bpfLoader.load(
+        connection,
+        contract.bytecode,
+        programId
+      );
 
-            logger.info('Contract upgraded', {
-                contractId,
-                programId,
-                network,
-                signature: upgrade.signature
-            });
+      // Update deployment status
+      await client.query(`
+        UPDATE deployments
+        SET status = $1,
+            signature = $2,
+            metadata = jsonb_set(
+              metadata,
+              '{deployment}',
+              $3::jsonb
+            ),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $4
+      `, [
+        DeploymentStatus.SUCCESS,
+        result.signature,
+        JSON.stringify({
+          timestamp: new Date().toISOString(),
+          slot: result.slot,
+          computeUnits: result.computeUnits
+        }),
+        deployment.id
+      ]);
 
-            res.json({
-                success: true,
-                data: {
-                    programId: upgrade.programId,
-                    signature: upgrade.signature,
-                    network,
-                    timestamp: upgrade.timestamp,
-                    status: upgrade.status,
-                    logs: upgrade.logs
-                }
-            });
-        } catch (error) {
-            logger.error('Contract upgrade failed', {
-                contractId,
-                programId,
-                network,
-                error: error.message,
-                stack: error.stack
-            });
-            throw error;
-        }
-    };
+      await client.query('COMMIT');
 
-    public validateDeployment = async (req: Request, res: Response): Promise<void> => {
-        const { contractId, network, options } = req.body;
+      MetricsService.increment('deployment.success', { 
+        network: deployment.network 
+      });
+    } catch (error) {
+      await client.query('ROLLBACK');
 
-        try {
-            const contract = await this.stateManager.loadAccount(
-                new PublicKey(contractId)
-            );
+      // Update deployment with error
+      await this.db.query(`
+        UPDATE deployments
+        SET status = $1,
+            error_message = $2,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $3
+      `, [
+        DeploymentStatus.FAILED,
+        error.message,
+        deployment.id
+      ]);
 
-            if (!contract) {
-                throw new NotFoundError('Contract');
-            }
+      MetricsService.increment('deployment.failure', { 
+        network: deployment.network,
+        error: error.code || 'UNKNOWN'
+      });
 
-            const validationResult = await this.deploymentService.validateDeployment(
-                contract,
-                network,
-                options
-            );
-
-            logger.info('Deployment validation completed', {
-                contractId,
-                network,
-                isValid: validationResult.isValid
-            });
-
-            res.json({
-                success: true,
-                data: {
-                    isValid: validationResult.isValid,
-                    errors: validationResult.errors,
-                    warnings: validationResult.warnings,
-                    checks: validationResult.checks
-                }
-            });
-        } catch (error) {
-            logger.error('Deployment validation failed', {
-                contractId,
-                network,
-                error: error.message
-            });
-            throw error;
-        }
-    };
-
-    public getDeploymentHistory = async (req: Request, res: Response): Promise<void> => {
-        const { contractId } = req.params;
-        const { limit, offset } = req.query;
-
-        try {
-            const contract = await this.stateManager.loadAccount(
-                new PublicKey(contractId)
-            );
-
-            if (!contract) {
-                throw new NotFoundError('Contract');
-            }
-
-            const history = await this.deploymentService.getDeploymentHistory(
-                contractId,
-                {
-                    limit: Number(limit) || 10,
-                    offset: Number(offset) || 0
-                }
-            );
-
-            res.json({
-                success: true,
-                data: {
-                    deployments: history.deployments,
-                    total: history.total,
-                    hasMore: history.hasMore
-                }
-            });
-        } catch (error) {
-            logger.error('Deployment history fetch failed', {
-                contractId,
-                error: error.message
-            });
-            throw error;
-        }
-    };
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
 }
+
+export default new DeploymentController();
