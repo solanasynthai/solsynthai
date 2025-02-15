@@ -9,7 +9,7 @@ SolSynthai automates the creation, optimization, and deployment of Solana smart 
 
 [Web App](https://solsynthai.org) (Beta-release scheduled for 1st March 2025)
 
-## 🌟 Features
+## Features
 
 ### Smart Contract Generation & Analysis
 - 🤖 AI-powered smart contract generation
@@ -109,7 +109,7 @@ docker-compose -f docker-compose.prod.yml build
 docker-compose -f docker-compose.prod.yml up -d
 ```
 
-## 🏗️ Architecture
+## Architecture
 
 ### Backend Stack
 - **Framework**: Express.js with TypeScript
@@ -134,7 +134,7 @@ docker-compose -f docker-compose.prod.yml up -d
 - **Tracing**: OpenTelemetry
 - **Error Tracking**: Sentry
 
-## 📚 Documentation
+## Documentation
 
 - [API Documentation](https://docs.solsynthai.org/api) [COMING SOON]
 - [User Guide](https://docs.solsynthai.org/guide) [COMING SOON]
@@ -142,7 +142,7 @@ docker-compose -f docker-compose.prod.yml up -d
 - [Deployment Guide](https://docs.solsynthai.org/deploy) [COMING SOON]
 - [Security Overview](https://docs.solsynthai.org/security) [COMING SOON]
 
-## 🧪 Testing
+## Testing
 
 ### Backend Testing
 ```bash
@@ -166,7 +166,7 @@ yarn test:ui
 yarn test:coverage
 ```
 
-## 🔄 CI/CD Pipeline
+## CI/CD Pipeline
 
 Our CI/CD pipeline includes:
 - Automated testing
@@ -176,7 +176,7 @@ Our CI/CD pipeline includes:
 - Automated deployments
 - Performance benchmarking
 
-## 📊 Monitoring & Metrics
+## Monitoring & Metrics
 
 Access the monitoring stack:
 - Grafana: http://localhost:3000
@@ -189,7 +189,7 @@ Default metrics include:
 - Error rates
 - User activity
 
-## 🛡️ Security
+## Security
 
 ### Security Features
 - HTTPS enforcement
@@ -207,7 +207,7 @@ Default metrics include:
 - Audit logging
 - Access control
 
-## 🤝 Contributing
+## Contributing
 
 1. Fork the repository
 2. Create your feature branch: `git checkout -b feature/amazing-feature`
@@ -215,16 +215,16 @@ Default metrics include:
 4. Push to the branch: `git push origin feature/amazing-feature`
 5. Open a Pull Request
 
-## 📄 License
+## License
 
 This project is licensed under the MIT License - see the [LICENSE](https://github.com/solanasynthai/solsynthai/blob/main/license.md) file for details.
 
-## 📞 Support
+## Support
 
 - Telegram: [Join Community](https://t.me/solanasynthai)
 - Website: [SolSynthAI](https://solsynthai.org)
   
-## 🙋 FAQ
+## FAQ
 
 <details>
 <summary>What is SolSynthAI?</summary>
@@ -242,7 +242,7 @@ Please report security vulnerabilities to security@solsynthai.org or through our
 </details>
 
 
-## 🌟 Acknowledgments
+## Acknowledgments
 
 - Solana Foundation
 - OpenAI
