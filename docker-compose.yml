@@ -1,105 +1,137 @@
-version: '3.9'
+version: '4.0'
 
 services:
-  frontend:
-    build:
-      context: ./frontend
-      target: production
-    image: solsynthai/frontend:${TAG:-latest}
-    ports:
-      - "3000:3000"
-    environment:
-      - NODE_ENV=production
-      - VITE_API_URL=https://api.solsynthai.com
-      - VITE_WS_URL=wss://api.solsynthai.com
-    depends_on:
-      - backend
-    networks:
-      - solsynthai-network
-    healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
-
-  backend:
+  # Backend API service
+  api:
     build:
       context: ./backend
-      target: production
-    image: solsynthai/backend:${TAG:-latest}
-    ports:
-      - "4000:4000"
-    environment:
-      - NODE_ENV=production
-      - APP_PORT=4000
-      - DB_HOST=postgres
-      - DB_PORT=5432
-      - DB_NAME=solsynthai
-      - DB_USER=${DB_USER}
-      - DB_PASSWORD=${DB_PASSWORD}
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - REDIS_PASSWORD=${REDIS_PASSWORD}
-      - JWT_SECRET=${JWT_SECRET}
-      - AI_API_KEY=${AI_API_KEY}
-      - SOLANA_RPC_URL=${SOLANA_RPC_URL}
+      dockerfile: Dockerfile
+      args:
+        NODE_ENV: production
+    image: solsynthai/api:${TAG:-latest}
+    container_name: solsynthai-api
+    restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://solsynthai_app:${DB_PASSWORD}@postgres:5432/solsynthai
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
+      - JWT_SECRET=${JWT_SECRET}
+      - SOLANA_RPC_URL=${SOLANA_RPC_URL}
+      - SENTRY_DSN=${SENTRY_DSN}
+      - PORT=3000
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+      - contract-cache:/app/cache
     networks:
       - solsynthai-network
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:4000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
-    deploy:
-      replicas: 2
-      update_config:
-        parallelism: 1
-        delay: 10s
-      restart_policy:
-        condition: on-failure
-        max_attempts: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "10"
 
-  postgres:
-    image: postgres:15-alpine
+  # Frontend service
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: ${API_URL}
+        VITE_SOLANA_NETWORK: ${SOLANA_NETWORK:-devnet}
+    image: solsynthai/frontend:${TAG:-latest}
+    container_name: solsynthai-frontend
+    restart: unless-stopped
     ports:
-      - "5432:5432"
-    environment:
-      - POSTGRES_DB=solsynthai
-      - POSTGRES_USER=${DB_USER}
-      - POSTGRES_PASSWORD=${DB_PASSWORD}
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./backend/src/database/schema.sql:/docker-entrypoint-initdb.d/1-schema.sql
-      - ./backend/src/database/migrations:/docker-entrypoint-initdb.d/migrations
+      - "80:80"
+    depends_on:
+      - api
     networks:
       - solsynthai-network
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d solsynthai"]
+      test: ["CMD", "curl", "-f", "http://localhost:80"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "10"
+
+  # PostgreSQL database
+  postgres:
+    image: postgres:15-alpine
+    container_name: solsynthai-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=solsynthai
+      - POSTGRES_USER=solsynthai_app
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./backend/src/database/schema.sql:/docker-entrypoint-initdb.d/1-schema.sql
+      - ./backend/src/database/migrations:/docker-entrypoint-initdb.d/migrations
+    ports:
+      - "5432:5432"
+    networks:
+      - solsynthai-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U solsynthai_app -d solsynthai"]
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 30s
-    deploy:
-      resources:
-        limits:
-          memory: 2G
-        reservations:
-          memory: 1G
+    command: 
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - effective_cache_size=1536MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - wal_buffers=16MB
+      - -c
+      - default_statistics_target=100
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
+      - -c
+      - work_mem=6553kB
+      - -c
+      - min_wal_size=1GB
+      - -c
+      - max_wal_size=4GB
 
+  # Redis cache
   redis:
     image: redis:7-alpine
+    container_name: solsynthai-redis
+    restart: unless-stopped
     command: redis-server --requirepass ${REDIS_PASSWORD}
+    volumes:
+      - redis-data:/data
     ports:
       - "6379:6379"
-    volumes:
-      - redis_data:/data
     networks:
       - solsynthai-network
     healthcheck:
@@ -107,86 +139,54 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 30s
-    deploy:
-      resources:
-        limits:
-          memory: 1G
-        reservations:
-          memory: 512M
 
+  # Monitoring service
   prometheus:
-    image: prom/prometheus:v2.47.0
+    image: prom/prometheus:latest
+    container_name: solsynthai-prometheus
+    restart: unless-stopped
     volumes:
-      - ./monitoring/prometheus:/etc/prometheus
-      - prometheus_data:/prometheus
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
-      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
     ports:
       - "9090:9090"
     networks:
       - solsynthai-network
-    deploy:
-      resources:
-        limits:
-          memory: 1G
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
 
+  # Visualization
   grafana:
-    image: grafana/grafana:10.1.5
-    volumes:
-      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
-      - grafana_data:/var/lib/grafana
+    image: grafana/grafana:latest
+    container_name: solsynthai-grafana
+    restart: unless-stopped
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
       - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
     ports:
       - "3001:3000"
     networks:
       - solsynthai-network
     depends_on:
       - prometheus
-    deploy:
-      resources:
-        limits:
-          memory: 1G
-
-  nginx:
-    image: nginx:1.25-alpine
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./nginx/conf.d:/etc/nginx/conf.d
-      - ./nginx/ssl:/etc/nginx/ssl
-      - ./nginx/logs:/var/log/nginx
-    depends_on:
-      - frontend
-      - backend
-    networks:
-      - solsynthai-network
-    healthcheck:
-      test: ["CMD", "nginx", "-t"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    deploy:
-      resources:
-        limits:
-          memory: 512M
 
 networks:
   solsynthai-network:
     driver: bridge
 
 volumes:
-  postgres_data:
+  postgres-data:
     driver: local
-  redis_data:
+  redis-data:
     driver: local
-  prometheus_data:
+  contract-cache:
     driver: local
-  grafana_data:
+  prometheus-data:
+    driver: local
+  grafana-data:
     driver: local
