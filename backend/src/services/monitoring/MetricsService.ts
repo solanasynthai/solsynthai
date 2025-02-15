@@ -1,227 +1,287 @@
-import client, { Registry, Gauge, Counter, Histogram } from 'prom-client'
-import express from 'express'
-import { logger, logError } from '../../utils/logger'
-import config from '../../config/config'
-
-interface MetricLabels {
-  [key: string]: string | number
-}
+import { StatsD } from 'node-statsd';
+import * as Sentry from '@sentry/node';
+import { ProfilingIntegration } from '@sentry/profiling-node';
+import { Redis } from 'ioredis';
+import { MetricsRepository } from '../../repositories/MetricsRepository';
+import { logger } from '../../utils/logger';
+import { config } from '../../config';
 
 export class MetricsService {
-  private static instance: MetricsService
-  private registry: Registry
-  private server?: express.Application
-  private readonly metrics: Map<string, client.Metric<string>>
-
-  private readonly DEFAULT_PERCENTILES = [0.01, 0.05, 0.5, 0.9, 0.95, 0.99]
-  private readonly DEFAULT_BUCKETS = [
-    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10
-  ]
+  private static instance: MetricsService;
+  private statsd: StatsD;
+  private redis: Redis;
+  private metricsRepo: MetricsRepository;
+  private readonly METRICS_PREFIX = 'solsynthai.';
+  private readonly RATE_LIMIT_PREFIX = 'rate_limit:';
+  private readonly METRICS_FLUSH_INTERVAL = 10000; // 10 seconds
+  private readonly ERROR_THRESHOLD = 0.05; // 5% error rate threshold
 
   private constructor() {
-    this.registry = new Registry()
-    this.metrics = new Map()
+    // Initialize StatsD client
+    this.statsd = new StatsD({
+      host: config.monitoring.statsd.host,
+      port: config.monitoring.statsd.port,
+      prefix: this.METRICS_PREFIX,
+      errorHandler: (error) => {
+        logger.error('StatsD error:', { error });
+      },
+      bufferFlushInterval: this.METRICS_FLUSH_INTERVAL
+    });
 
-    // Register default metrics
-    if (process.env.NODE_ENV === 'production') {
-      this.registry.setDefaultLabels({
-        app: 'solsynthai',
-        env: process.env.NODE_ENV,
-        version: process.env.APP_VERSION || '0.0.0'
-      })
-      client.collectDefaultMetrics({ register: this.registry })
-    }
+    // Initialize Redis connection
+    this.redis = new Redis(config.redis.url, {
+      retryStrategy: (times) => Math.min(times * 50, 2000),
+      enableReadyCheck: true
+    });
 
-    this.initializeMetrics()
+    // Initialize Metrics Repository
+    this.metricsRepo = MetricsRepository.getInstance();
+
+    // Initialize Sentry
+    this.initializeSentry();
+
+    // Start background tasks
+    this.startBackgroundTasks();
   }
 
   public static getInstance(): MetricsService {
     if (!MetricsService.instance) {
-      MetricsService.instance = new MetricsService()
+      MetricsService.instance = new MetricsService();
     }
-    return MetricsService.instance
+    return MetricsService.instance;
   }
 
-  public async startServer(): Promise<void> {
-    if (!config.metrics.prometheusEnabled) return
+  public increment(metric: string, tags: Record<string, string> = {}): void {
+    try {
+      const formattedTags = this.formatTags(tags);
+      this.statsd.increment(`${metric}${formattedTags}`);
+    } catch (error) {
+      logger.error('Failed to increment metric', { metric, tags, error });
+    }
+  }
+
+  public gauge(metric: string, value: number, tags: Record<string, string> = {}): void {
+    try {
+      const formattedTags = this.formatTags(tags);
+      this.statsd.gauge(`${metric}${formattedTags}`, value);
+    } catch (error) {
+      logger.error('Failed to record gauge', { metric, value, tags, error });
+    }
+  }
+
+  public timing(metric: string, duration: number, tags: Record<string, string> = {}): void {
+    try {
+      const formattedTags = this.formatTags(tags);
+      this.statsd.timing(`${metric}${formattedTags}`, duration);
+    } catch (error) {
+      logger.error('Failed to record timing', { metric, duration, tags, error });
+    }
+  }
+
+  public async trackRateLimit(
+    key: string,
+    limit: number,
+    window: number
+  ): Promise<boolean> {
+    const now = Date.now();
+    const rateKey = `${this.RATE_LIMIT_PREFIX}${key}`;
 
     try {
-      this.server = express()
-      
-      // Metrics endpoint
-      this.server.get('/metrics', async (req, res) => {
-        try {
-          res.set('Content-Type', this.registry.contentType)
-          res.end(await this.registry.metrics())
-        } catch (error) {
-          logError('Failed to serve metrics', error as Error)
-          res.status(500).end()
+      const multi = this.redis.multi();
+      multi.zadd(rateKey, now, now.toString());
+      multi.zremrangebyscore(rateKey, 0, now - window);
+      multi.zcard(rateKey);
+      multi.expire(rateKey, Math.ceil(window / 1000));
+
+      const results = await multi.exec();
+      if (!results) return false;
+
+      const count = results[2][1] as number;
+      return count <= limit;
+    } catch (error) {
+      logger.error('Rate limit check failed', { key, error });
+      return false;
+    }
+  }
+
+  public async recordError(
+    error: Error,
+    context: Record<string, any> = {}
+  ): Promise<void> {
+    try {
+      // Record in StatsD
+      this.increment('errors', {
+        type: error.name,
+        ...context
+      });
+
+      // Record in Sentry
+      Sentry.captureException(error, {
+        extra: context
+      });
+
+      // Store in database for analysis
+      await this.metricsRepo.saveError({
+        type: error.name,
+        message: error.message,
+        stack: error.stack,
+        context,
+        timestamp: new Date()
+      });
+
+      // Check error threshold
+      await this.checkErrorThreshold(error.name);
+    } catch (e) {
+      logger.error('Failed to record error', { originalError: error, recordingError: e });
+    }
+  }
+
+  public startTransaction(name: string, op?: string): Sentry.Transaction {
+    return Sentry.startTransaction({
+      name,
+      op
+    });
+  }
+
+  public recordHealthCheck(
+    service: string,
+    status: 'up' | 'down',
+    responseTime?: number
+  ): void {
+    this.gauge(`health.${service}`, status === 'up' ? 1 : 0);
+    if (responseTime) {
+      this.timing(`health.${service}.response_time`, responseTime);
+    }
+  }
+
+  public async getMetricsSummary(
+    timeframe: number = 3600
+  ): Promise<Record<string, any>> {
+    try {
+      const end = Date.now();
+      const start = end - (timeframe * 1000);
+
+      const [errors, performance, health] = await Promise.all([
+        this.metricsRepo.getErrorMetrics(start, end),
+        this.metricsRepo.getPerformanceMetrics(start, end),
+        this.metricsRepo.getHealthMetrics(start, end)
+      ]);
+
+      return {
+        timestamp: new Date(),
+        timeframe,
+        errors: {
+          total: errors.total,
+          byType: errors.byType,
+          rate: errors.rate
+        },
+        performance: {
+          averageResponseTime: performance.avgResponseTime,
+          p95ResponseTime: performance.p95ResponseTime,
+          requestRate: performance.requestRate
+        },
+        health: {
+          uptime: health.uptime,
+          services: health.services
         }
-      })
-
-      // Health check endpoint
-      this.server.get('/health', (req, res) => {
-        res.status(200).json({ status: 'healthy' })
-      })
-
-      this.server.listen(config.metrics.prometheusPort, () => {
-        logger.info(`Metrics server started on port ${config.metrics.prometheusPort}`)
-      })
-
+      };
     } catch (error) {
-      logError('Failed to start metrics server', error as Error)
+      logger.error('Failed to get metrics summary', { error });
+      throw error;
     }
   }
 
-  public increment(name: string, labels: MetricLabels = {}): void {
+  private initializeSentry(): void {
+    Sentry.init({
+      dsn: config.monitoring.sentry.dsn,
+      environment: config.env,
+      integrations: [
+        new ProfilingIntegration()
+      ],
+      tracesSampleRate: 0.1,
+      profilesSampleRate: 0.1
+    });
+  }
+
+  private startBackgroundTasks(): void {
+    // Flush metrics periodically
+    setInterval(() => {
+      this.flushMetrics();
+    }, this.METRICS_FLUSH_INTERVAL);
+
+    // Clean up old rate limit data
+    setInterval(() => {
+      this.cleanupRateLimits();
+    }, 3600000); // Every hour
+  }
+
+  private async flushMetrics(): Promise<void> {
     try {
-      const counter = this.getOrCreateCounter(name)
-      counter.inc(labels)
+      const metrics = await this.metricsRepo.getPendingMetrics();
+      if (metrics.length > 0) {
+        await Promise.all(
+          metrics.map(metric => this.recordMetric(metric))
+        );
+      }
     } catch (error) {
-      logError(`Failed to increment metric: ${name}`, error as Error)
+      logger.error('Failed to flush metrics', { error });
     }
   }
 
-  public decrement(name: string, labels: MetricLabels = {}): void {
+  private async cleanupRateLimits(): Promise<void> {
     try {
-      const counter = this.getOrCreateCounter(name)
-      counter.dec(labels)
+      const keys = await this.redis.keys(`${this.RATE_LIMIT_PREFIX}*`);
+      for (const key of keys) {
+        const now = Date.now();
+        await this.redis.zremrangebyscore(key, 0, now - 86400000); // Remove entries older than 24 hours
+      }
     } catch (error) {
-      logError(`Failed to decrement metric: ${name}`, error as Error)
+      logger.error('Failed to cleanup rate limits', { error });
     }
   }
 
-  public gauge(name: string, value: number, labels: MetricLabels = {}): void {
+  private async checkErrorThreshold(errorType: string): Promise<void> {
     try {
-      const gauge = this.getOrCreateGauge(name)
-      gauge.set(labels, value)
+      const errorRate = await this.metricsRepo.getErrorRate(errorType, 300); // 5 minutes
+      if (errorRate > this.ERROR_THRESHOLD) {
+        logger.warn('Error rate exceeded threshold', { errorType, rate: errorRate });
+        // Alert via Sentry
+        Sentry.captureMessage(`Error rate threshold exceeded for ${errorType}`, {
+          level: 'warning',
+          extra: { errorRate }
+        });
+      }
     } catch (error) {
-      logError(`Failed to set gauge: ${name}`, error as Error)
+      logger.error('Failed to check error threshold', { error });
     }
   }
 
-  public histogram(name: string, value: number, labels: MetricLabels = {}): void {
+  private async recordMetric(metric: any): Promise<void> {
     try {
-      const histogram = this.getOrCreateHistogram(name)
-      histogram.observe(labels, value)
+      switch (metric.type) {
+        case 'counter':
+          this.statsd.increment(metric.name, metric.value, metric.sampleRate);
+          break;
+        case 'gauge':
+          this.statsd.gauge(metric.name, metric.value);
+          break;
+        case 'timing':
+          this.statsd.timing(metric.name, metric.value);
+          break;
+        default:
+          logger.warn('Unknown metric type', { metric });
+      }
     } catch (error) {
-      logError(`Failed to observe histogram: ${name}`, error as Error)
+      logger.error('Failed to record metric', { metric, error });
     }
   }
 
-  public async reset(): Promise<void> {
-    try {
-      this.metrics.clear()
-      await this.registry.clear()
-      this.initializeMetrics()
-    } catch (error) {
-      logError('Failed to reset metrics', error as Error)
-    }
-  }
-
-  private initializeMetrics(): void {
-    // System metrics
-    this.createGauge('system_memory_usage', 'Memory usage in bytes')
-    this.createGauge('system_cpu_usage', 'CPU usage percentage')
-    this.createGauge('system_load_average', 'System load average')
-
-    // Application metrics
-    this.createCounter('http_requests_total', 'Total HTTP requests')
-    this.createHistogram('http_request_duration', 'HTTP request duration')
-    this.createGauge('active_connections', 'Number of active connections')
-
-    // Business metrics
-    this.createCounter('contract_generation_total', 'Total contract generations')
-    this.createHistogram('contract_generation_duration', 'Contract generation duration')
-    this.createGauge('contract_complexity_score', 'Contract complexity score')
-
-    // Cache metrics
-    this.createCounter('cache_hits_total', 'Total cache hits')
-    this.createCounter('cache_misses_total', 'Total cache misses')
-    this.createGauge('cache_size', 'Current cache size')
-
-    // Database metrics
-    this.createGauge('db_connections', 'Database connections')
-    this.createHistogram('db_query_duration', 'Database query duration')
-    this.createCounter('db_errors_total', 'Total database errors')
-
-    // Security metrics
-    this.createCounter('auth_failures_total', 'Total authentication failures')
-    this.createCounter('rate_limit_exceeded_total', 'Rate limit exceeded count')
-    this.createGauge('active_sessions', 'Number of active sessions')
-  }
-
-  private createCounter(name: string, help: string): Counter<string> {
-    const counter = new Counter({
-      name,
-      help,
-      registers: [this.registry]
-    })
-    this.metrics.set(name, counter)
-    return counter
-  }
-
-  private createGauge(name: string, help: string): Gauge<string> {
-    const gauge = new Gauge({
-      name,
-      help,
-      registers: [this.registry]
-    })
-    this.metrics.set(name, gauge)
-    return gauge
-  }
-
-  private createHistogram(name: string, help: string): Histogram<string> {
-    const histogram = new Histogram({
-      name,
-      help,
-      buckets: this.DEFAULT_BUCKETS,
-      registers: [this.registry]
-    })
-    this.metrics.set(name, histogram)
-    return histogram
-  }
-
-  private getOrCreateCounter(name: string): Counter<string> {
-    const metric = this.metrics.get(name)
-    if (metric instanceof Counter) {
-      return metric
-    }
-    return this.createCounter(name, `Counter for ${name}`)
-  }
-
-  private getOrCreateGauge(name: string): Gauge<string> {
-    const metric = this.metrics.get(name)
-    if (metric instanceof Gauge) {
-      return metric
-    }
-    return this.createGauge(name, `Gauge for ${name}`)
-  }
-
-  private getOrCreateHistogram(name: string): Histogram<string> {
-    const metric = this.metrics.get(name)
-    if (metric instanceof Histogram) {
-      return metric
-    }
-    return this.createHistogram(name, `Histogram for ${name}`)
-  }
-
-  public async getMetrics(): Promise<string> {
-    try {
-      return await this.registry.metrics()
-    } catch (error) {
-      logError('Failed to get metrics', error as Error)
-      return ''
-    }
-  }
-
-  public async clearMetrics(): Promise<void> {
-    try {
-      await this.registry.clear()
-    } catch (error) {
-      logError('Failed to clear metrics', error as Error)
-    }
+  private formatTags(tags: Record<string, string>): string {
+    if (Object.keys(tags).length === 0) return '';
+    return '.' + Object.entries(tags)
+      .map(([key, value]) => `${key}:${value}`)
+      .join('.');
   }
 }
 
-export default MetricsService
+export default MetricsService.getInstance();
