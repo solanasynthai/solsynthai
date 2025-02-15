@@ -1,200 +1,199 @@
-import { cleanEnv, str, num, bool, url, email } from 'envalid'
-import { config as dotenvConfig } from 'dotenv'
+import * as dotenv from 'dotenv';
+import { Connection } from '@solana/web3.js';
+import { z } from 'zod';
+import { logger } from '../utils/logger';
 
 // Load environment variables
-dotenvConfig()
+dotenv.config();
 
-// Validate and transform environment variables
-const env = cleanEnv(process.env, {
-  // Application
-  NODE_ENV: str({ choices: ['development', 'production', 'test'] }),
-  APP_VERSION: str({ default: '1.0.0' }),
-  APP_NAME: str({ default: 'SolSynthai' }),
-  APP_PORT: num({ default: 4000 }),
-  API_PREFIX: str({ default: '/api' }),
-  COOKIE_SECRET: str(),
-  CORS_ORIGIN: str(),
-  REQUEST_LIMIT: str({ default: '10mb' }),
-  RATE_LIMIT_WINDOW: num({ default: 900000 }), // 15 minutes
-  RATE_LIMIT_MAX_REQUESTS: num({ default: 100 }),
+// Configuration schema validation
+const ConfigSchema = z.object({
+  env: z.enum(['development', 'test', 'staging', 'production']),
+  server: z.object({
+    port: z.number().min(1).max(65535),
+    host: z.string().min(1),
+    cors: z.object({
+      origin: z.union([z.string(), z.array(z.string())]),
+      methods: z.array(z.string()),
+      allowedHeaders: z.array(z.string()),
+      exposedHeaders: z.array(z.string()),
+      credentials: z.boolean()
+    })
+  }),
+  database: z.object({
+    host: z.string().min(1),
+    port: z.number().min(1).max(65535),
+    user: z.string().min(1),
+    password: z.string().min(1),
+    database: z.string().min(1),
+    ssl: z.boolean(),
+    max: z.number().min(1),
+    idleTimeoutMillis: z.number().min(0)
+  }),
+  redis: z.object({
+    url: z.string().url(),
+    prefix: z.string(),
+    ttl: z.number().min(0)
+  }),
+  solana: z.object({
+    networks: z.record(z.string(), z.string().url()),
+    defaultNetwork: z.string(),
+    commitment: z.string(),
+    maxRetries: z.number().min(0),
+    confirmations: z.number().min(1)
+  }),
+  monitoring: z.object({
+    sentry: z.object({
+      dsn: z.string().url(),
+      environment: z.string(),
+      tracesSampleRate: z.number().min(0).max(1)
+    }),
+    statsd: z.object({
+      host: z.string(),
+      port: z.number().min(1).max(65535)
+    }),
+    logLevel: z.string()
+  }),
+  security: z.object({
+    jwtSecret: z.string().min(32),
+    saltRounds: z.number().min(10),
+    rateLimit: z.object({
+      windowMs: z.number().min(0),
+      max: z.number().min(1)
+    }),
+    cors: z.object({
+      allowedOrigins: z.array(z.string())
+    })
+  }),
+  cache: z.object({
+    defaultTTL: z.number().min(0),
+    compilationTTL: z.number().min(0),
+    deploymentTTL: z.number().min(0)
+  }),
+  compiler: z.object({
+    maxSize: z.number().min(0),
+    timeout: z.number().min(0),
+    optimizationLevels: z.array(z.string()),
+    supportedVersions: z.array(z.string())
+  })
+});
 
-  // Authentication
-  JWT_SECRET: str(),
-  JWT_EXPIRATION: str({ default: '1h' }),
-  REFRESH_TOKEN_SECRET: str(),
-  REFRESH_TOKEN_EXPIRATION: str({ default: '7d' }),
-  PASSWORD_SALT_ROUNDS: num({ default: 12 }),
-
-  // Database
-  DB_HOST: str(),
-  DB_PORT: num({ default: 5432 }),
-  DB_NAME: str(),
-  DB_USER: str(),
-  DB_PASSWORD: str(),
-  DB_SSL: bool({ default: true }),
-  DB_MAX_CONNECTIONS: num({ default: 20 }),
-  DB_IDLE_TIMEOUT: num({ default: 30000 }),
-  DB_CONNECTION_TIMEOUT: num({ default: 2000 }),
-
-  // Redis Cache
-  REDIS_HOST: str(),
-  REDIS_PORT: num({ default: 6379 }),
-  REDIS_PASSWORD: str(),
-  REDIS_DB: num({ default: 0 }),
-  REDIS_TLS: bool({ default: true }),
-  REDIS_RECONNECT_ATTEMPTS: num({ default: 10 }),
-  REDIS_RECONNECT_DELAY: num({ default: 3000 }),
-
-  // WebSocket
-  WS_MAX_CONNECTIONS: num({ default: 1000 }),
-  WS_PING_INTERVAL: num({ default: 30000 }),
-  WS_TIMEOUT: num({ default: 120000 }),
-  WS_MESSAGE_SIZE_LIMIT: num({ default: 5242880 }), // 5MB
-
-  // AI Service
-  AI_API_KEY: str(),
-  AI_API_ENDPOINT: url(),
-  AI_API_VERSION: str({ default: 'v1' }),
-  AI_REQUEST_TIMEOUT: num({ default: 30000 }),
-  AI_MAX_TOKENS: num({ default: 2048 }),
-  AI_TEMPERATURE: num({ default: 0.7 }),
-
-  // Solana
-  SOLANA_RPC_URL: url(),
-  SOLANA_NETWORK: str({ choices: ['mainnet-beta', 'testnet', 'devnet'] }),
-  SOLANA_WALLET_SECRET: str(),
-  SOLANA_COMMITMENT: str({ choices: ['processed', 'confirmed', 'finalized'] }),
-
-  // Monitoring
-  METRICS_ENABLED: bool({ default: true }),
-  METRICS_PREFIX: str({ default: 'solsynthai_' }),
-  LOG_LEVEL: str({ choices: ['debug', 'info', 'warn', 'error'] }),
-  SENTRY_DSN: str({ default: '' }),
-  SENTRY_ENVIRONMENT: str({ default: 'production' }),
-  SENTRY_TRACES_SAMPLE_RATE: num({ default: 0.1 }),
-
-  // Security
-  SECURITY_HEADERS_ENABLED: bool({ default: true }),
-  CSP_ENABLED: bool({ default: true }),
-  RATE_LIMITER_ENABLED: bool({ default: true }),
-  MAX_REQUEST_SIZE: str({ default: '10mb' }),
-  SSL_KEY_PATH: str({ default: '' }),
-  SSL_CERT_PATH: str({ default: '' }),
-  IP_WHITELIST: str({ default: '' }),
-
-  // Admin
-  ADMIN_EMAIL: email(),
-  SUPPORT_EMAIL: email({ default: 'support@solsynthai.com' }),
-})
-
-export const config = {
-  app: {
-    env: env.NODE_ENV,
-    version: env.APP_VERSION,
-    name: env.APP_NAME,
-    port: env.APP_PORT,
-    apiPrefix: env.API_PREFIX,
-    cookieSecret: env.COOKIE_SECRET,
-    corsOrigin: env.CORS_ORIGIN.split(','),
-    requestLimit: env.REQUEST_LIMIT,
+// Configuration object
+const config = {
+  env: process.env.NODE_ENV || 'development',
+  server: {
+    port: parseInt(process.env.PORT || '3000', 10),
+    host: process.env.HOST || '0.0.0.0',
+    cors: {
+      origin: process.env.CORS_ORIGIN?.split(',') || '*',
+      methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
+      allowedHeaders: ['Content-Type', 'Authorization'],
+      exposedHeaders: ['X-Total-Count'],
+      credentials: true
+    }
   },
-
-  auth: {
-    jwtSecret: env.JWT_SECRET,
-    jwtExpiration: env.JWT_EXPIRATION,
-    refreshTokenSecret: env.REFRESH_TOKEN_SECRET,
-    refreshTokenExpiration: env.REFRESH_TOKEN_EXPIRATION,
-    passwordSaltRounds: env.PASSWORD_SALT_ROUNDS,
-  },
-
   database: {
-    host: env.DB_HOST,
-    port: env.DB_PORT,
-    database: env.DB_NAME,
-    user: env.DB_USER,
-    password: env.DB_PASSWORD,
-    ssl: env.DB_SSL,
-    pool: {
-      max: env.DB_MAX_CONNECTIONS,
-      idleTimeoutMillis: env.DB_IDLE_TIMEOUT,
-      connectionTimeoutMillis: env.DB_CONNECTION_TIMEOUT,
-    },
-    migrations: {
-      directory: './src/database/migrations',
-      tableName: 'migrations',
-    },
+    host: process.env.DB_HOST || 'localhost',
+    port: parseInt(process.env.DB_PORT || '5432', 10),
+    user: process.env.DB_USER || 'postgres',
+    password: process.env.DB_PASSWORD || '',
+    database: process.env.DB_NAME || 'solsynthai',
+    ssl: process.env.DB_SSL === 'true',
+    max: parseInt(process.env.DB_POOL_MAX || '20', 10),
+    idleTimeoutMillis: parseInt(process.env.DB_IDLE_TIMEOUT || '30000', 10)
   },
-
   redis: {
-    host: env.REDIS_HOST,
-    port: env.REDIS_PORT,
-    password: env.REDIS_PASSWORD,
-    db: env.REDIS_DB,
-    tls: env.REDIS_TLS ? {} : undefined,
-    maxRetriesPerRequest: env.REDIS_RECONNECT_ATTEMPTS,
-    retryStrategy: (times: number) => {
-      if (times > env.REDIS_RECONNECT_ATTEMPTS) return null
-      return Math.min(times * env.REDIS_RECONNECT_DELAY, 10000)
-    },
+    url: process.env.REDIS_URL || 'redis://localhost:6379',
+    prefix: 'solsynthai:',
+    ttl: parseInt(process.env.REDIS_TTL || '3600', 10)
   },
-
-  websocket: {
-    maxConnections: env.WS_MAX_CONNECTIONS,
-    pingInterval: env.WS_PING_INTERVAL,
-    timeout: env.WS_TIMEOUT,
-    messageSizeLimit: env.WS_MESSAGE_SIZE_LIMIT,
-  },
-
-  ai: {
-    apiKey: env.AI_API_KEY,
-    apiEndpoint: env.AI_API_ENDPOINT,
-    apiVersion: env.AI_API_VERSION,
-    requestTimeout: env.AI_REQUEST_TIMEOUT,
-    maxTokens: env.AI_MAX_TOKENS,
-    temperature: env.AI_TEMPERATURE,
-  },
-
   solana: {
-    rpcUrl: env.SOLANA_RPC_URL,
-    network: env.SOLANA_NETWORK,
-    walletSecret: env.SOLANA_WALLET_SECRET,
-    commitment: env.SOLANA_COMMITMENT,
+    networks: {
+      mainnet: process.env.SOLANA_MAINNET_URL || 'https://api.mainnet-beta.solana.com',
+      testnet: process.env.SOLANA_TESTNET_URL || 'https://api.testnet.solana.com',
+      devnet: process.env.SOLANA_DEVNET_URL || 'https://api.devnet.solana.com',
+      localnet: 'http://localhost:8899'
+    },
+    defaultNetwork: process.env.SOLANA_DEFAULT_NETWORK || 'devnet',
+    commitment: 'confirmed',
+    maxRetries: 3,
+    confirmations: 1
   },
-
   monitoring: {
-    metricsEnabled: env.METRICS_ENABLED,
-    metricsPrefix: env.METRICS_PREFIX,
-    logLevel: env.LOG_LEVEL,
     sentry: {
-      dsn: env.SENTRY_DSN,
-      environment: env.SENTRY_ENVIRONMENT,
-      tracesSampleRate: env.SENTRY_TRACES_SAMPLE_RATE,
+      dsn: process.env.SENTRY_DSN || '',
+      environment: process.env.NODE_ENV || 'development',
+      tracesSampleRate: parseFloat(process.env.SENTRY_TRACES_SAMPLE_RATE || '0.1')
     },
+    statsd: {
+      host: process.env.STATSD_HOST || 'localhost',
+      port: parseInt(process.env.STATSD_PORT || '8125', 10)
+    },
+    logLevel: process.env.LOG_LEVEL || 'info'
   },
-
   security: {
-    headersEnabled: env.SECURITY_HEADERS_ENABLED,
-    cspEnabled: env.CSP_ENABLED,
-    rateLimiter: {
-      enabled: env.RATE_LIMITER_ENABLED,
-      windowMs: env.RATE_LIMIT_WINDOW,
-      max: env.RATE_LIMIT_MAX_REQUESTS,
+    jwtSecret: process.env.JWT_SECRET || 'your-secret-key',
+    saltRounds: parseInt(process.env.SALT_ROUNDS || '12', 10),
+    rateLimit: {
+      windowMs: parseInt(process.env.RATE_LIMIT_WINDOW || '900000', 10), // 15 minutes
+      max: parseInt(process.env.RATE_LIMIT_MAX || '100', 10)
     },
-    ssl: {
-      keyPath: env.SSL_KEY_PATH,
-      certPath: env.SSL_CERT_PATH,
-    },
-    ipWhitelist: env.IP_WHITELIST ? env.IP_WHITELIST.split(',') : [],
+    cors: {
+      allowedOrigins: process.env.ALLOWED_ORIGINS?.split(',') || []
+    }
   },
-
-  admin: {
-    email: env.ADMIN_EMAIL,
-    supportEmail: env.SUPPORT_EMAIL,
+  cache: {
+    defaultTTL: parseInt(process.env.CACHE_TTL || '3600', 10),
+    compilationTTL: parseInt(process.env.COMPILATION_CACHE_TTL || '86400', 10),
+    deploymentTTL: parseInt(process.env.DEPLOYMENT_CACHE_TTL || '3600', 10)
   },
+  compiler: {
+    maxSize: parseInt(process.env.MAX_CONTRACT_SIZE || '1048576', 10), // 1MB
+    timeout: parseInt(process.env.COMPILATION_TIMEOUT || '30000', 10),
+    optimizationLevels: ['speed', 'size', 'balanced'],
+    supportedVersions: ['1.75.0', '1.74.0', '1.73.0']
+  }
+} as const;
 
-  isDevelopment: env.NODE_ENV === 'development',
-  isProduction: env.NODE_ENV === 'production',
-  isTest: env.NODE_ENV === 'test',
-} as const
+// Validate configuration
+try {
+  ConfigSchema.parse(config);
+} catch (error) {
+  logger.error('Configuration validation failed', { error });
+  process.exit(1);
+}
 
-export default config
+// Connection cache for Solana networks
+const connections: Record<string, Connection> = {};
+
+// Helper functions
+export const getConnection = (network: string = config.solana.defaultNetwork): Connection => {
+  if (!connections[network]) {
+    connections[network] = new Connection(config.solana.networks[network], {
+      commitment: config.solana.commitment as any,
+      confirmTransactionInitialTimeout: 60000
+    });
+  }
+  return connections[network];
+};
+
+export const validateConfig = (): void => {
+  // Additional validation logic
+  if (config.env === 'production') {
+    if (config.security.jwtSecret === 'your-secret-key') {
+      throw new Error('JWT secret must be changed in production');
+    }
+    if (!config.monitoring.sentry.dsn) {
+      throw new Error('Sentry DSN is required in production');
+    }
+    if (config.database.password === '') {
+      throw new Error('Database password is required in production');
+    }
+  }
+};
+
+// Initialize configuration
+validateConfig();
+
+export { config };
+export type Config = typeof config;
