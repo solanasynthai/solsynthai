@@ -1,193 +1,208 @@
--- Enable UUID extension
+-- Enable necessary extensions if not already enabled
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-
--- Enable pgcrypto for password hashing
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+CREATE EXTENSION IF NOT EXISTS "citext";
 
--- Create custom types
-CREATE TYPE user_role AS ENUM ('admin', 'developer', 'auditor');
-CREATE TYPE contract_status AS ENUM ('draft', 'reviewing', 'published', 'archived');
-CREATE TYPE security_level AS ENUM ('low', 'medium', 'high');
-CREATE TYPE optimization_level AS ENUM ('low', 'medium', 'high');
+-- Set search path
+SET search_path TO app, public;
 
--- Create users table
+-- Users table
 CREATE TABLE users (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    username VARCHAR(50) NOT NULL UNIQUE,
-    email VARCHAR(255) NOT NULL UNIQUE,
-    password_hash VARCHAR(255) NOT NULL,
-    role user_role NOT NULL DEFAULT 'developer',
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    last_login_at TIMESTAMP WITH TIME ZONE,
+    public_key TEXT NOT NULL UNIQUE,
+    username CITEXT UNIQUE,
+    email CITEXT UNIQUE,
+    avatar_url TEXT,
+    bio TEXT,
+    roles TEXT[] DEFAULT ARRAY['user'],
+    permissions TEXT[] DEFAULT ARRAY[]::TEXT[],
+    organization_id UUID,
     is_active BOOLEAN DEFAULT true,
-    is_email_verified BOOLEAN DEFAULT false,
-    verification_token UUID,
-    reset_token UUID,
-    reset_token_expires_at TIMESTAMP WITH TIME ZONE,
-    CONSTRAINT username_length CHECK (char_length(username) >= 3)
+    last_login_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT valid_public_key CHECK (public_key ~ '^[1-9A-HJ-NP-Za-km-z]{32,44}$')
 );
 
--- Create sessions table
-CREATE TABLE sessions (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    refresh_token VARCHAR(255) NOT NULL,
-    ip_address INET,
-    user_agent TEXT,
-    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT unique_active_session UNIQUE (user_id, refresh_token)
-);
-
--- Create contracts table
+-- Contracts table
 CREATE TABLE contracts (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    name VARCHAR(100) NOT NULL,
+    name TEXT NOT NULL,
     description TEXT,
-    author_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-    code TEXT NOT NULL,
-    status contract_status NOT NULL DEFAULT 'draft',
-    security_level security_level NOT NULL DEFAULT 'medium',
-    optimization_level optimization_level NOT NULL DEFAULT 'medium',
-    version VARCHAR(20) NOT NULL DEFAULT '1.0.0',
-    is_template BOOLEAN DEFAULT false,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    published_at TIMESTAMP WITH TIME ZONE,
-    compilation_result JSONB,
-    analysis_result JSONB,
-    metadata JSONB
+    version TEXT NOT NULL,
+    author_id UUID NOT NULL REFERENCES users(id),
+    program_id TEXT UNIQUE,
+    status TEXT NOT NULL CHECK (status IN ('draft', 'compiled', 'audited', 'deployed', 'archived', 'deprecated')),
+    visibility TEXT NOT NULL CHECK (visibility IN ('private', 'public', 'organization')),
+    source_code TEXT NOT NULL,
+    bytecode BYTEA,
+    metadata JSONB NOT NULL DEFAULT '{}',
+    compilation_settings JSONB NOT NULL DEFAULT '{}',
+    deployment_settings JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    deployed_at TIMESTAMPTZ,
+    last_audited_at TIMESTAMPTZ,
+    CONSTRAINT valid_program_id CHECK (program_id IS NULL OR program_id ~ '^[1-9A-HJ-NP-Za-km-z]{32,44}$')
 );
 
--- Create contract_versions table
+-- Contract versions table
 CREATE TABLE contract_versions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    contract_id UUID NOT NULL REFERENCES contracts(id) ON DELETE CASCADE,
-    version VARCHAR(20) NOT NULL,
-    code TEXT NOT NULL,
-    commit_message TEXT,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    author_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-    compilation_result JSONB,
-    analysis_result JSONB,
-    CONSTRAINT unique_contract_version UNIQUE (contract_id, version)
+    contract_id UUID NOT NULL REFERENCES contracts(id),
+    version TEXT NOT NULL,
+    source_code TEXT NOT NULL,
+    bytecode BYTEA,
+    metadata JSONB NOT NULL DEFAULT '{}',
+    changes TEXT,
+    created_by UUID NOT NULL REFERENCES users(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (contract_id, version)
 );
 
--- Create contract_audits table
-CREATE TABLE contract_audits (
+-- Deployments table
+CREATE TABLE deployments (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    contract_id UUID NOT NULL REFERENCES contracts(id) ON DELETE CASCADE,
-    auditor_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-    version VARCHAR(20) NOT NULL,
-    status VARCHAR(20) NOT NULL,
-    findings JSONB,
-    started_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    completed_at TIMESTAMP WITH TIME ZONE,
-    report TEXT,
-    severity_score INTEGER CHECK (severity_score BETWEEN 0 AND 100)
+    contract_id UUID NOT NULL REFERENCES contracts(id),
+    version_id UUID NOT NULL REFERENCES contract_versions(id),
+    deployer_id UUID NOT NULL REFERENCES users(id),
+    network TEXT NOT NULL CHECK (network IN ('mainnet-beta', 'testnet', 'devnet', 'localnet')),
+    program_id TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'processing', 'success', 'failed')),
+    error_message TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT valid_deployment_program_id CHECK (program_id ~ '^[1-9A-HJ-NP-Za-km-z]{32,44}$')
 );
 
--- Create templates table
-CREATE TABLE templates (
+-- Audits table
+CREATE TABLE audits (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    name VARCHAR(100) NOT NULL,
+    contract_id UUID NOT NULL REFERENCES contracts(id),
+    version_id UUID NOT NULL REFERENCES contract_versions(id),
+    auditor_id UUID NOT NULL REFERENCES users(id),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'in_progress', 'completed', 'failed')),
+    security_score INTEGER CHECK (security_score BETWEEN 0 AND 100),
+    findings JSONB NOT NULL DEFAULT '[]',
+    recommendations JSONB NOT NULL DEFAULT '[]',
+    report_url TEXT,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Analytics table
+CREATE TABLE analytics (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    contract_id UUID NOT NULL REFERENCES contracts(id),
+    deployment_id UUID REFERENCES deployments(id),
+    network TEXT NOT NULL,
+    transaction_count BIGINT NOT NULL DEFAULT 0,
+    unique_users BIGINT NOT NULL DEFAULT 0,
+    compute_units_total BIGINT NOT NULL DEFAULT 0,
+    compute_units_avg DOUBLE PRECISION,
+    execution_time_avg DOUBLE PRECISION,
+    error_rate DOUBLE PRECISION,
+    metrics JSONB NOT NULL DEFAULT '{}',
+    period_start TIMESTAMPTZ NOT NULL,
+    period_end TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Organizations table
+CREATE TABLE organizations (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name TEXT NOT NULL UNIQUE,
+    display_name TEXT,
     description TEXT,
-    category VARCHAR(50) NOT NULL,
-    code TEXT NOT NULL,
-    created_by UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-    is_public BOOLEAN DEFAULT false,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    metadata JSONB
-);
-
--- Create api_keys table
-CREATE TABLE api_keys (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    key_hash VARCHAR(255) NOT NULL,
-    name VARCHAR(100) NOT NULL,
-    expires_at TIMESTAMP WITH TIME ZONE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    last_used_at TIMESTAMP WITH TIME ZONE,
+    website_url TEXT,
+    avatar_url TEXT,
     is_active BOOLEAN DEFAULT true,
-    permissions JSONB
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
--- Create audit_logs table
+-- Organization members table
+CREATE TABLE organization_members (
+    organization_id UUID NOT NULL REFERENCES organizations(id),
+    user_id UUID NOT NULL REFERENCES users(id),
+    role TEXT NOT NULL CHECK (role IN ('owner', 'admin', 'member')),
+    joined_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (organization_id, user_id)
+);
+
+-- Audit logs table
 CREATE TABLE audit_logs (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    user_id UUID REFERENCES users(id) ON DELETE SET NULL,
-    action VARCHAR(50) NOT NULL,
-    resource_type VARCHAR(50) NOT NULL,
-    resource_id UUID,
-    details JSONB,
+    user_id UUID REFERENCES users(id),
+    action TEXT NOT NULL,
+    resource_type TEXT NOT NULL,
+    resource_id UUID NOT NULL,
+    details JSONB NOT NULL DEFAULT '{}',
     ip_address INET,
     user_agent TEXT,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Create indexes
-CREATE INDEX idx_contracts_author_id ON contracts(author_id);
+CREATE INDEX idx_contracts_author ON contracts(author_id);
 CREATE INDEX idx_contracts_status ON contracts(status);
-CREATE INDEX idx_contract_versions_contract_id ON contract_versions(contract_id);
-CREATE INDEX idx_contract_audits_contract_id ON contract_audits(contract_id);
-CREATE INDEX idx_contract_audits_auditor_id ON contract_audits(auditor_id);
-CREATE INDEX idx_templates_category ON templates(category);
-CREATE INDEX idx_api_keys_user_id ON api_keys(user_id);
-CREATE INDEX idx_audit_logs_user_id ON audit_logs(user_id);
-CREATE INDEX idx_audit_logs_created_at ON audit_logs(created_at);
-CREATE INDEX idx_sessions_user_id ON sessions(user_id);
-
--- Create updated_at trigger function
-CREATE OR REPLACE FUNCTION update_updated_at_column()
-RETURNS TRIGGER AS $$
-BEGIN
-    NEW.updated_at = CURRENT_TIMESTAMP;
-    RETURN NEW;
-END;
-$$ language 'plpgsql';
+CREATE INDEX idx_contracts_visibility ON contracts(visibility);
+CREATE INDEX idx_contract_versions_contract ON contract_versions(contract_id);
+CREATE INDEX idx_deployments_contract ON deployments(contract_id);
+CREATE INDEX idx_deployments_status ON deployments(status);
+CREATE INDEX idx_audits_contract ON audits(contract_id);
+CREATE INDEX idx_analytics_contract ON analytics(contract_id);
+CREATE INDEX idx_audit_logs_user ON audit_logs(user_id);
+CREATE INDEX idx_audit_logs_resource ON audit_logs(resource_type, resource_id);
+CREATE INDEX idx_organization_members_user ON organization_members(user_id);
 
 -- Create updated_at triggers
-CREATE TRIGGER update_users_updated_at
+CREATE TRIGGER set_updated_at
     BEFORE UPDATE ON users
     FOR EACH ROW
-    EXECUTE FUNCTION update_updated_at_column();
+    EXECUTE FUNCTION app.maintain_updated_at();
 
-CREATE TRIGGER update_contracts_updated_at
+CREATE TRIGGER set_updated_at
     BEFORE UPDATE ON contracts
     FOR EACH ROW
-    EXECUTE FUNCTION update_updated_at_column();
+    EXECUTE FUNCTION app.maintain_updated_at();
 
-CREATE TRIGGER update_templates_updated_at
-    BEFORE UPDATE ON templates
+CREATE TRIGGER set_updated_at
+    BEFORE UPDATE ON deployments
     FOR EACH ROW
-    EXECUTE FUNCTION update_updated_at_column();
+    EXECUTE FUNCTION app.maintain_updated_at();
 
--- Add initial admin user (password to be changed on first login)
-INSERT INTO users (
-    username,
-    email,
-    password_hash,
-    role,
-    is_active,
-    is_email_verified
-) VALUES (
-    'admin',
-    'admin@solsynthai.com',
-    crypt('changeme123', gen_salt('bf')),
-    'admin',
-    true,
-    true
-);
+CREATE TRIGGER set_updated_at
+    BEFORE UPDATE ON audits
+    FOR EACH ROW
+    EXECUTE FUNCTION app.maintain_updated_at();
 
--- Add comments
-COMMENT ON TABLE users IS 'User accounts for the system';
-COMMENT ON TABLE sessions IS 'User session management';
-COMMENT ON TABLE contracts IS 'Smart contracts created by users';
-COMMENT ON TABLE contract_versions IS 'Version history of contracts';
-COMMENT ON TABLE contract_audits IS 'Security audits of contracts';
-COMMENT ON TABLE templates IS 'Reusable contract templates';
-COMMENT ON TABLE api_keys IS 'API authentication keys';
-COMMENT ON TABLE audit_logs IS 'System audit trail';
+CREATE TRIGGER set_updated_at
+    BEFORE UPDATE ON organizations
+    FOR EACH ROW
+    EXECUTE FUNCTION app.maintain_updated_at();
+
+-- Create audit log triggers
+CREATE TRIGGER audit_contract_changes
+    AFTER INSERT OR UPDATE OR DELETE ON contracts
+    FOR EACH ROW
+    EXECUTE FUNCTION app.audit_trigger();
+
+CREATE TRIGGER audit_deployment_changes
+    AFTER INSERT OR UPDATE OR DELETE ON deployments
+    FOR EACH ROW
+    EXECUTE FUNCTION app.audit_trigger();
+
+CREATE TRIGGER audit_audit_changes
+    AFTER INSERT OR UPDATE OR DELETE ON audits
+    FOR EACH ROW
+    EXECUTE FUNCTION app.audit_trigger();
+
+-- Grant permissions
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA app TO solsynthai_app;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA app TO solsynthai_app;
+GRANT SELECT ON ALL TABLES IN SCHEMA app TO solsynthai_readonly;
